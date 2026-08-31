@@ -1,0 +1,41 @@
+name: check
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+# Read-only by default. No step here needs to write to the repository.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # Every platform the README tells users to install on. Building only on Linux
+    # would leave the macOS and Windows binaries unverified until a release.
+    strategy:
+      # Report every platform. One failing must not cancel the others, or a
+      # Windows-only problem hides whether macOS passed.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      # Actions are pinned to a commit rather than a tag: a tag can be moved to
+      # point at different code, a commit cannot.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      # Formatting cannot differ by platform, so check it once. The command is
+      # also POSIX shell, which is not the default shell on the Windows runner.
+      - name: gofmt
+        if: matrix.os == 'ubuntu-latest'
+        run: test -z "$(gofmt -l ./cmd ./internal)"
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -race ./...

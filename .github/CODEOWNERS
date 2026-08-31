@@ -1,0 +1,7 @@
+# Review requests for anything in this repository go to the development team.
+#
+# This repository is exported from an internal one, so changes normally originate
+# upstream rather than here. Ownership is deliberately flat: there are no
+# per-directory owners, because splitting ownership across an exported copy would
+# route reviews by a structure that is not where the code is maintained.
+*       @infostellarinc/developers

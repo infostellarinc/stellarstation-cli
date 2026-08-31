@@ -1,0 +1,143 @@
+// Copyright 2026 Infostellar, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+import "stellarstation/starpass/v1/radio/radio.proto";
+
+package stellarstation.starpass.v1;
+
+option go_package = "stellarstation.com/grpcapis/starpass/v1";
+
+option java_multiple_files = true;
+option java_package = "com.stellarstation.starpass.v1";
+
+// Types exchanged between the cloud and a StarPass ground station during a
+// pass: the telemetry framing and payload types, and the ground station
+// configuration requests.
+
+// A type of framing of a binary payload used in satellite communication.
+enum Framing {
+  // No framing done in the API. All payloads are assumed to be pre-framed and ready for
+  // transmission to the satellite or API client with no additional processing.
+  BITSTREAM = 0;
+
+  // AX.25 (Amateur X.25) framing - https://en.wikipedia.org/wiki/AX.25
+  AX25 = 1;
+
+  // No framing or demodulation done in the API. Raw IQ data is sent to the API client with no
+  // additional processing.
+  IQ = 2;
+
+  // A decoded PNG image frame.
+  IMAGE_PNG = 3;
+
+  // A decoded JPEG image.
+  IMAGE_JPEG = 4;
+
+  // Completely arbitrary, freeform text contained in a frame.
+  FREE_TEXT_UTF8 = 5;
+
+  // A waterfall diagram. This is actually for the whole plan and does not correspond to an
+  // individual frame.
+  WATERFALL = 6;
+}
+
+// A chunk or frame of telemetry data that has been received from a satellite.
+message Telemetry {
+  // The framing of this telemetry data.
+  Framing framing = 1;
+
+  // The payload of this telemetry.
+  bytes data = 2;
+
+  // The actual downlink frequency, in Hz, used when receiving `data`, including adjustments for
+  // doppler shift.
+  uint64 downlink_frequency_hz = 3;
+
+  // Timestamp when the first byte of `data` was received.
+  google.protobuf.Timestamp time_first_byte_received = 4;
+
+  // Timestamp when the last byte of `data` was received.
+  google.protobuf.Timestamp time_last_byte_received = 5;
+
+  // The binary header of the telemetry frame available for certain framing types.
+  //
+  // * AX25      - This is either Address + Control, or Address + Control + PID. The checksum is not
+  //               returned.
+  // * BITSTREAM - Streams for certain protocols such as CCSDS may contain frame headers according
+  //               to the applicable standards.
+  bytes frame_header = 6;
+}
+
+// A request to modify configuration of ground station hardware.
+//
+// Next ID: 3
+// Status: ALPHA This API is under development and may not work correctly or be changed in backwards
+//         incompatible ways in the future.
+message GroundStationConfigurationRequest {
+  // A request to modify transmitter configuration at a ground station.
+  TransmitterConfigurationRequest transmitter_configuration_request = 1;
+
+  // A request to modify receiver configuration at a ground station.
+  ReceiverConfigurationRequest receiver_configuration_request = 2;
+}
+
+// A request to configure a transmitter at a ground station. Default state of these parameters
+// depends on hardware configuration at each ground station. Please check TransmitterConfiguration
+// and TransmitterState in monitoring message.
+//
+// Not all configuration requests are supported by some transmitters. If a field isn't set,
+// the configuration will not be changed.
+//
+// Next ID: 7
+message TransmitterConfigurationRequest {
+  // Enable carrier transmission.
+  google.protobuf.BoolValue enable_carrier = 1;
+
+  // Enable IF modulation.
+  google.protobuf.BoolValue enable_if_modulation = 2;
+
+  // Enable idle pattern transmission.
+  google.protobuf.BoolValue enable_idle_pattern = 3;
+
+  // Enable IF sweep.
+  google.protobuf.BoolValue enable_if_sweep = 4;
+
+  // Bitrate of the transmitter
+  google.protobuf.FloatValue bitrate = 5;
+
+  // Modulation of the transmitter. Note that the default modulation is DISABLED and
+  // will be ignored. There is no way to disable modulation using this method.
+  radio.Modulation modulation = 6;
+}
+
+// A request to configure a receiver at a ground station. Default state of these parameters
+// depends on hardware configuration at each ground station. Please check ReceiverConfiguration
+// and ReceiverState in monitoring message.
+//
+// Not all configuration requests are supported by some receivers. If a field isn't set,
+// the configuration will not be changed.
+//
+// Next ID: 3
+message ReceiverConfigurationRequest {
+  // Bitrate of the receiver.
+  google.protobuf.FloatValue bitrate = 1;
+
+  // Modulation of the receiver. Note that the default modulation is DISABLED and
+  // will be ignored. There is no way to disable modulation using this method.
+  radio.Modulation modulation = 2;
+}

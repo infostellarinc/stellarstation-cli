@@ -1,0 +1,151 @@
+// Copyright 2026 Infostellar, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package stellarstation.starpass.v1.radio;
+
+option go_package = "stellarstation.com/grpcapis/starpass/v1/radio";
+
+option java_multiple_files = true;
+option java_package = "com.stellarstation.starpass.v1.radio";
+
+// Types exchanged between the cloud and a StarPass ground station during a
+// pass.
+//
+// This file carries the radio types reachable from the pass-time monitoring
+// and configuration messages. The radio types used to describe a scheduled
+// pass are defined separately.
+
+// Type of modulation. Modulation is the process of converting binary data (0's and 1's) to
+// an analog wave for use in radio communication.
+// Next ID: 27.
+enum Modulation {
+  // Indicates modulation is disabled and raw I/Q is being used.
+  DISABLED = 0;
+
+  // Frequency Shift Keying. https://en.wikipedia.org/wiki/Frequency-shift_keying
+  FSK = 1;
+
+  // Audio Frequency Shift Keying. https://en.wikipedia.org/wiki/Frequency-shift_keying#Audio_FSK
+  AFSK = 2;
+
+  // Binary Phase Shift Keying. https://en.wikipedia.org/wiki/Phase-shift_keying#Binary_phase-shift_keying_(BPSK)
+  BPSK = 3;
+
+  // Multiple Frequency Shift Keying. https://en.wikipedia.org/wiki/Multiple_frequency-shift_keying
+  MFSK = 4;
+
+  // Quadrature Phase Shift Keying. https://en.wikipedia.org/wiki/Phase-shift_keying#Quadrature_phase-shift_keying_(QPSK)
+  QPSK = 5;
+
+  // 8-Phase Shift Keying. https://en.wikipedia.org/wiki/Phase-shift_keying
+  PSK8 = 6;
+
+  // 16-Phase Shift Keying. https://en.wikipedia.org/wiki/Phase-shift_keying
+  PSK16 = 7;
+
+  // 32-Phase Shift Keying. https://en.wikipedia.org/wiki/Phase-shift_keying
+  PSK32 = 8;
+
+  // 64-Phase Shift Keying. https://en.wikipedia.org/wiki/Phase-shift_keying
+  PSK64 = 9;
+
+  // 128-Phase Shift Keying. https://en.wikipedia.org/wiki/Phase-shift_keying
+  PSK128 = 10;
+
+  // 256-Phase Shift Keying. https://en.wikipedia.org/wiki/Phase-shift_keying
+  PSK256 = 11;
+
+
+  // Offset Quadrature Phase Shift Keying. https://en.wikipedia.org/wiki/Phase-shift_keying#Offset_QPSK_(OQPSK)
+  OQPSK = 12;
+
+
+  // 8-Phase Amplitude Modulation. https://en.wikipedia.org/wiki/Quadrature_amplitude_modulation
+  QAM8 = 13;
+
+  // 16-Phase Amplitude Modulation. https://en.wikipedia.org/wiki/Quadrature_amplitude_modulation
+  QAM16 = 14;
+
+  // 32-Phase Amplitude Modulation. https://en.wikipedia.org/wiki/Quadrature_amplitude_modulation
+  QAM32 = 15;
+
+  // 64-Phase Amplitude Modulation. https://en.wikipedia.org/wiki/Quadrature_amplitude_modulation
+  QAM64 = 16;
+
+  // 128-Phase Amplitude Modulation. https://en.wikipedia.org/wiki/Quadrature_amplitude_modulation
+  QAM128 = 17;
+
+  // 256-Phase Amplitude Modulation. https://en.wikipedia.org/wiki/Quadrature_amplitude_modulation
+  QAM256 = 18;
+
+
+  // Minimum Shift Keying. https://en.wikipedia.org/wiki/Minimum-shift_keying
+  MSK = 19;
+
+  // Gaussian Minimum Shift Keying. https://en.wikipedia.org/wiki/Minimum-shift_keying#Gaussian_minimum-shift_keying
+  GMSK = 20;
+
+
+  // Amplitude modulation (generic)
+  AM = 21;
+
+  // Frequency modulation (generic)
+  FM = 22;
+
+  // Phase modulation (generic)
+  PM = 23;
+
+  // PCM/PSK/PM as specified by CCSDS. https://public.ccsds.org/Pubs/401x0b29.pdf
+  PCM_PSK_PM = 24;
+
+  // PCM/PM/bi-phase-L as specified by CCSDS. https://public.ccsds.org/Pubs/401x0b29.pdf
+  PCM_PM_BI_PHASE_L = 25;
+
+  // 16-Amplitude Phase Shift Keying. https://en.wikipedia.org/wiki/Amplitude_and_phase-shift_keying
+  APSK16 = 26;
+}
+
+// Line coding applied during modulation. Line coding is the technique for modeling binary 0 and 1
+// within a modulated waveform.
+enum LineCoding {
+  // Non-return-to-zero level.
+  // https://en.wikipedia.org/wiki/Non-return-to-zero
+  NRZ_L = 0;
+
+  // Non-return-to-zero mark (i.e., differential encoding).
+  // https://en.wikipedia.org/wiki/Non-return-to-zero
+  NRZ_M = 1;
+
+  // Non-return-to-zero space (i.e., non-differential-encoding).
+  // https://en.wikipedia.org/wiki/Non-return-to-zero
+  NRZ_S = 2;
+
+  // Differential non-return-to-zero.
+  // https://en.wikipedia.org/wiki/Return-to-zero
+  DNRZ = 3;
+
+  // Bipolar return-to-zero level.
+  // https://en.wikipedia.org/wiki/Bipolar_encoding
+  BP_L = 4;
+
+  // Bipolar return-to-zero mark (i.e., differential encoding).
+  // https://en.wikipedia.org/wiki/Bipolar_encoding
+  BP_M = 5;
+
+  // Bipolar return-to-zero space (i.e., non-differential encoding).
+  // https://en.wikipedia.org/wiki/Bipolar_encoding
+  BP_S = 6;
+}

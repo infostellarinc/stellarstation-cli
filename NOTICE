@@ -1,0 +1,74 @@
+StellarStation CLI
+Copyright Infostellar, Inc.
+
+This product is licensed under the Apache License, Version 2.0. See the LICENSE
+file for the full text.
+
+This product includes third-party software. The components below are compiled
+into the released binaries. Their licence texts are available at the source
+repository for each, and this file lists the licence each is distributed under.
+
+------------------------------------------------------------------------------
+Eclipse Public License 2.0
+------------------------------------------------------------------------------
+
+  github.com/eclipse/paho.mqtt.golang
+
+  Source: https://github.com/eclipse/paho.mqtt.golang
+  Licence: https://github.com/eclipse/paho.mqtt.golang/blob/master/LICENSE
+
+  This component is used unmodified. Its source is available at the URL above.
+
+------------------------------------------------------------------------------
+Apache License 2.0
+------------------------------------------------------------------------------
+
+  github.com/aws/aws-sdk-go-v2
+  github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream
+  github.com/aws/aws-sdk-go-v2/config
+  github.com/aws/aws-sdk-go-v2/credentials
+  github.com/aws/aws-sdk-go-v2/feature/ec2/imds
+  github.com/aws/aws-sdk-go-v2/internal/configsources
+  github.com/aws/aws-sdk-go-v2/internal/endpoints/v2
+  github.com/aws/aws-sdk-go-v2/internal/v4a
+  github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding
+  github.com/aws/aws-sdk-go-v2/service/internal/checksum
+  github.com/aws/aws-sdk-go-v2/service/internal/presigned-url
+  github.com/aws/aws-sdk-go-v2/service/internal/s3shared
+  github.com/aws/aws-sdk-go-v2/service/s3
+  github.com/aws/aws-sdk-go-v2/service/signin
+  github.com/aws/aws-sdk-go-v2/service/sso
+  github.com/aws/aws-sdk-go-v2/service/ssooidc
+  github.com/aws/aws-sdk-go-v2/service/sts
+  github.com/aws/smithy-go
+  github.com/spf13/cobra
+
+------------------------------------------------------------------------------
+BSD 3-Clause License
+------------------------------------------------------------------------------
+
+  github.com/aws/aws-sdk-go-v2/internal/sync/singleflight
+  github.com/aws/smithy-go/internal/sync/singleflight
+  github.com/google/uuid
+  github.com/spf13/pflag
+  golang.org/x/net
+  golang.org/x/sync/semaphore
+  golang.org/x/sys/unix
+  google.golang.org/protobuf
+
+------------------------------------------------------------------------------
+BSD 2-Clause License
+------------------------------------------------------------------------------
+
+  github.com/gorilla/websocket
+
+------------------------------------------------------------------------------
+MIT License
+------------------------------------------------------------------------------
+
+  github.com/charmbracelet/x/term
+
+------------------------------------------------------------------------------
+
+This list is generated from the module graph with `go-licenses report ./...`.
+Regenerate it when dependencies change.

@@ -1,0 +1,12 @@
+# Types only: the CLI never dials gRPC, so no service stubs are generated and
+# the module avoids the gRPC dependency tree entirely.
+version: v1
+managed:
+  enabled: true
+  go_package_prefix:
+    default: github.com/infostellarinc/stellarstation-cli/gen/pb
+plugins:
+  - plugin: go
+    out: gen/pb
+    opt:
+      - paths=source_relative

@@ -1,0 +1,40 @@
+version: 2
+
+project_name: stellar
+
+builds:
+  - main: ./cmd/stellar
+    binary: stellar
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      # v{{ .Version }} rather than {{ .Version }}: the leading v makes a
+      # goreleaser build report the same string as a `go install module@v0.1.0`
+      # build, which reads the module version. .Version also keeps the commit in
+      # snapshot builds, which .Tag would drop.
+      - -s -w -X main.releaseVersion=v{{ .Version }}
+
+archives:
+  - formats: [tar.gz]
+    # goreleaser ships LICENSE*, README* and CHANGELOG* by default. NOTICE is not
+    # in that set, and EPL-2.0 asks that binary distribution carry its notice.
+    files:
+      - LICENSE
+      - NOTICE
+      - README.md
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+
+checksum:
+  name_template: checksums.txt
+
+release:
+  draft: true

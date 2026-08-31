@@ -1,0 +1,368 @@
+// Copyright (c) 2021 InfoStellar, Inc. All Rights Reserved.
+
+// End License
+
+// This file contains the messages transferred between the cloud and StarPass. This is a little
+// different than our normal APIs as it uses MQTT (AWS IoT Core) as the transport instead of gRPC,
+// but it is still the definition of the API contract between the cloud and StarPass.
+
+syntax = "proto3";
+
+package stellarstation.satellitestreamer.messages;
+
+import "google/protobuf/timestamp.proto";
+
+// Framing and the ground station configuration requests come from
+// starpass/v1; the ground station state, configuration and event messages
+// come from starpass/v1/monitoring.
+import "stellarstation/starpass/v1/monitoring/monitoring.proto";
+import "stellarstation/starpass/v1/starpass.proto";
+
+option java_multiple_files = true;
+option java_package = "com.stellarstation.satellitestreamer.messages";
+
+option go_package = "stellarstation.com/grpcapis/streaming";
+
+// Format of the IQ data.
+message IqFormat {
+  // Sampling rate of IQ data (Hz).
+  uint32 sample_rate_hz = 1;
+
+  // IQ encoding type.
+  enum Encoding {
+    // Single-precision floating point as per IEEE-754.
+    FLOAT = 0;
+
+    // Half-precision floating point as per IEEE-754.
+    HALF_FLOAT = 1;
+
+    // AR2300-specific format (32-bit fixed point).
+    AR2300 = 2;
+  }
+
+  // Encoding of the IQ data.
+  Encoding encoding = 2;
+}
+
+// Parameters for decimation compression.
+message DecimationCompressionParams {
+  // How the IQ data has been decimated.
+  uint32 decimation_factor = 1;
+}
+
+// Telemetry data that has been received by an antenna from a satellite.
+//
+// Next ID: 11
+message Telemetry {
+  // Retired field numbers and names. These must not be reused.
+  reserved 1, 6, 10;
+  reserved "type", "has_framing", "none";
+
+  // The framing of this telemetry.
+  stellarstation.starpass.v1.Framing framing = 8;
+
+  // Timestamp when the first byte of Telemetry.data was received.
+  google.protobuf.Timestamp timeFirstByteReceived = 2;
+
+  // Timestamp when the last byte of Telemetry.data was received.
+  google.protobuf.Timestamp timeLastByteReceived = 3;
+
+  // The payload of this telemetry.
+  bytes data = 4;
+
+  // The extracted header of the frame, set when `framing` indicates a type for which
+  // we extract frame header.
+  bytes frame_header = 9;
+
+  // Format of IQ data. Unset for decoded data.
+  IqFormat iq_format = 5;
+
+  // Compression scheme used before sending the telemetry. Unset means no compression.
+  oneof compression {
+    // Decimation (sampling rate reduction)
+    DecimationCompressionParams decimation = 7;
+  }
+}
+
+// A message containing consecutive chunks or frames of telemetry data sent from a StarPass for a
+// satellite.
+message SendTelemetryMessage {
+  // The type of telemetry in this `SendTelemetryMessage`.
+  enum Type {
+    // Indicates the request includes data continuing a started pass. It is expected a single
+    // request with type == START was sent before this.
+    CONTINUE = 0;
+
+    // Indicates the request is the first in a pass. Should be set for the first request in a pass.
+    // If type == START is not sent, the service may use heuristics to try to determine if it is
+    // part of an existing pass or a new one, but this is not well defined.
+    //
+    // This should not be confused with the start of an RPC stream. If the RPC stream is cancelled
+    // for any reason in the middle of a pass, the client should re-connect and send requests with
+    // type == CONTINUE as it normally would have had the stream stayed connected.
+    START = 1;
+
+    // Indicates the request is the last in a pass. Should be set for the last request in a pass.
+    // If type == END is not sent, the service may use heuristics to determine if later data should
+    // start a new pass or be added to this one, but this is not well defined.
+    END = 2;
+  }
+  // The type of this request. For a given pass, this should be set as START -> CONTINUE -> CONTINUE
+  // -> ... -> CONTINUE -> CONTINUE -> END.
+  Type type = 1;
+
+  // The ID of the pass this telemetry is associated with.
+  string pass_id = 2;
+
+  // The ID of the antenna sending the request.
+  string antenna_id = 3;
+
+  // The ID of the satellite for which the data was received, as part of an expected pass. Can be
+  // unset for data received from the antenna outside of expected passes.
+  string satellite_id = 4;
+
+  // The telemetry chunks or frames.
+  repeated Telemetry telemetry = 5;
+
+  // The stream index of the first frame in the `telemetry` field: a cumulative
+  // frame offset, advanced by the frame count of each message. Starts at 1 per
+  // (pass, channel, framing).
+  uint32 first_frame_index = 6;
+
+  // Retired field number. It must not be reused.
+  reserved 7;
+
+  // The channel id we're streaming for.
+  string channel_id = 8;
+
+  // The dense, gap-free 1..N index of this message within its
+  // (pass, channel, framing), advanced by one per message. Matches the index
+  // in the storage object key of the bundle this message is stored as, so a
+  // message can be located in storage from an ack or a retransmit request.
+  // 0 when the producer does not set it.
+  uint64 message_index = 9;
+}
+
+// A message containing current various state sent from StarPass for monitoring.
+message MonitoringMessage {
+  // The ID of the pass these metrics are associated with.
+  string pass_id = 1;
+
+  // The ID of the antenna sending the request.
+  string antenna_id = 2;
+
+  // The ID of the satellite this pass is for.
+  string satellite_id = 3;
+
+  // Timestamp when this metrics was recorded on StarPass.
+  google.protobuf.Timestamp recorded_at = 4;
+
+  // The current state of the ground station.
+  stellarstation.starpass.v1.monitoring.GroundStationState state = 5;
+
+  // Index of the logical state capture this message was derived from. The
+  // station captures its state once per tick and fans that one capture out to
+  // the pass-level topic and every per-channel topic; every published copy of
+  // one capture carries the same index, so consumers can de-duplicate the
+  // copies and count captures rather than publishes. Starts at 1 and
+  // increases per pass. 0 when the producer does not set it; consumers may
+  // then fall back to recorded_at.
+  uint64 index = 6;
+}
+
+// A message containing current configuration sent from StarPass.
+message ConfigurationMessage {
+  // The ID of the pass this data is associated with.
+  string pass_id = 1;
+
+  // The ID of the antenna sending the request.
+  string antenna_id = 2;
+
+  // The ID of the satellite this pass is for.
+  string satellite_id = 3;
+
+  // Timestamp when this configuration was retrieved on StarPass.
+  google.protobuf.Timestamp recorded_at = 4;
+
+  // This contains current configuration which is applied for receiver and transmitter.
+  stellarstation.starpass.v1.monitoring.GroundStationConfiguration configuration = 5;
+
+  // Index of the logical configuration capture this message was derived
+  // from; see MonitoringMessage.index.
+  uint64 index = 6;
+}
+
+// A message containing an event sent from StarPass.
+message EventMessage {
+  // The ID of the pass this data is associated with.
+  string pass_id = 1;
+
+  // The ID of the antenna sending the request.
+  string antenna_id = 2;
+
+  // The ID of the satellite this pass is for.
+  string satellite_id = 3;
+
+  // Timestamp when this configuration was retrieved on StarPass.
+  google.protobuf.Timestamp recorded_at = 4;
+
+  // This contains the event that happened on the ground station.
+  stellarstation.starpass.v1.monitoring.GroundStationEvent event = 5;
+
+  // Index of this event within the pass. Starts at 1 and increases by one per
+  // event published by the station's event sequencer, so consumers can
+  // de-duplicate copies. 0 means the publisher does not participate in the
+  // sequence (the plan-lifecycle exporter publishes outside it, and some
+  // producers do not set it); consumers must fall back to recorded_at for
+  // index 0 and must not treat the sequence as gap-free.
+  uint64 index = 6;
+}
+
+// A message containing data from a StarPass for a satellite. Published to the pass-specific
+// MQTT topics (downlink, monitoring, config_state, event).
+message FromStarPassMessage {
+  // Retired field numbers and names. These must not be reused.
+  reserved 1, 4, 5, 7;
+  reserved "type", "telemetry", "index";
+
+  // The ID of the pass this telemetry is associated with.
+  string pass_id = 6;
+
+  // The ID of the antenna sending the request.
+  string antenna_id = 2;
+
+  // The ID of the satellite for which the data was received, as part of an expected pass. Can be
+  // unset for data received from the antenna outside of expected passes.
+  string satellite_id = 3;
+
+  oneof Message {
+    // A message with telemetry to send from the StarPass.
+    SendTelemetryMessage send_telemetry_message = 8;
+
+    // A message containing real-time monitoring during a pass. Will be sent continuously.
+    MonitoringMessage monitoring_message = 9;
+
+    // A message containing the configuration of a ground station during a pass. Will be sent once at the beginning.
+    ConfigurationMessage configuration_message = 10;
+
+    // A message containing an event that happened during a pass.
+    EventMessage event_message = 11;
+  }
+
+  // Unique ID of this message (UUID v4), set by the sender when the message is
+  // constructed. Each published message gets its own ID: when one logical
+  // capture fans out to multiple topics, every copy carries a distinct
+  // message_id (use the payload index fields to de-duplicate logical
+  // captures). Acks reference this value. Empty when the producer does not
+  // set it.
+  string message_id = 12;
+}
+
+// An acknowledgement of a FromStarPassMessage or ToStarPassMessage, published
+// on the acknowledged message's topic with "/ack" appended.
+//
+// Consumers accept only this encoding. Senders that do not set message IDs
+// leave acked_message_id empty, and consumers then fall back to
+// (stream_id, index).
+message Ack {
+  // The message_id of the message being acknowledged. Empty when the
+  // acknowledged message carries no ID.
+  string acked_message_id = 1;
+
+  enum Status {
+    ACK = 0;
+    NACK = 1;
+  }
+  // Whether the message was accepted or rejected.
+  Status status = 2;
+
+  // Why the message was rejected. Set only when status == NACK.
+  string reason = 3;
+
+  // This ack's own unique ID (UUID v4), set by the publisher.
+  string message_id = 4;
+
+  // The ID of the stream the acknowledged message belongs to.
+  string stream_id = 5;
+
+  // The ID of the pass the acknowledged message belongs to.
+  string pass_id = 6;
+
+  // The acknowledged message's index, when it has one:
+  // SendTelemetryMessage.message_index for telemetry acks (falling back to
+  // first_frame_index when message_index is unset),
+  // ToStarPassMessage.index for uplink/config-request acks, and the payload
+  // message's index for monitoring/configuration/event acks.
+  uint64 index = 7;
+
+  // When the acknowledged message was received, from the acknowledging
+  // side's local clock at handling time. This is receipt time, not the
+  // payload's capture time; an S3-replayed message is acknowledged with the
+  // replay time.
+  google.protobuf.Timestamp received_at = 8;
+
+  // Payload bytes of the acknowledged message.
+  uint64 bytes = 9;
+
+  // The channel the acknowledged message arrived on, when per-channel.
+  string channel_id = 10;
+
+  // Telemetry framing name (e.g. BITSTREAM, IQ), for telemetry acks.
+  string framing_type = 11;
+
+  // Type of the acknowledged message, e.g. low_rate_telemetry,
+  // high_rate_telemetry, uplink, gs_config_request, monitoring,
+  // configuration, event.
+  string message_type = 12;
+}
+
+// A message with commands to send to a satellite.
+message SendCommandsMessage {
+  // The ID of the stream sending this request. This can be considered to represent a single
+  // "connection" to the satellite. If a new stream_id comes in, requests from the previous one can
+  // be discarded. Note that a stream may be long lived, spanning multiple passes.
+  string stream_id = 1;
+
+  // The ID of the currently active pass.
+  string pass_id = 2;
+
+  // The index of this request within a stream and pass. Requests should be handled by the StarPass
+  // in order, exactly once. The first request in a pass will have index '1'.
+  uint32 index = 3;
+
+  // The commands to send in this request. Each command should be sent as an individual frame.
+  repeated bytes command = 4;
+}
+
+// A request to send commands to a satellite. Published to the pass-specific MQTT topics
+// (uplink, config_request).
+message ToStarPassMessage {
+  // The ID of the stream sending this request. This can be considered to represent a single
+  // "connection" to the satellite. If a new stream_id comes in, requests from the previous one can
+  // be discarded. Note that a stream may be long lived, spanning multiple passes.
+  string stream_id = 1;
+
+  // The ID of the currently active pass.
+  string pass_id = 4;
+
+  // The index of this request within a stream and pass. Requests should be handled by the StarPass
+  // in order, exactly once. The first request in a pass will have index '1'.
+  uint32 index = 2;
+
+  // The commands to send in this request. Each command should be sent as an individual frame.
+  repeated bytes command = 3;
+
+  oneof Message {
+    // A message with commands to send to the StarPass.
+    SendCommandsMessage send_commands_message = 5;
+
+    // Request to modify a ground station configuration.
+    stellarstation.starpass.v1.GroundStationConfigurationRequest ground_station_configuration_request = 6;
+  }
+
+  // Unique ID of this message (UUID v4), set by the sender when the message is
+  // constructed. Acks reference this value. Empty when the producer does not
+  // set it.
+  string message_id = 7;
+}
+
