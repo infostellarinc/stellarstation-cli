@@ -3,3 +3,6 @@
 
 # written by open-stream when run from the repo root
 /downlink/
+
+# Python bytecode from the API examples
+examples/python/__pycache__/
