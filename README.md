@@ -316,6 +316,13 @@ stellar satellite open-stream --help
 Any command that produces a table also accepts `-o json` or `-o csv`, for
 feeding results into other tooling.
 
+## Calling the API from your own software
+
+Everything the CLI does goes through the StellarStation API, which your own
+software can call directly. Runnable Python examples, from listing satellites
+through reserving passes and downloading telemetry, are in
+[examples/python](examples/python/README.md).
+
 ## Troubleshooting
 
 - **"command not found"**: see step 1c of Setting up.
@@ -358,8 +365,8 @@ The sections above cover normal use. This reference covers additional options sh
 | `cancel-pass <pass-id>` | the pass ID | none |
 
 `--start` and `--stop` default to now and 7 days after the start, respectively. Omitting both
-gives the next 7 days. `--execution-status` accepts values such as `RESERVED`,
-`EXECUTING` and `COMPLETED`. On `list-passes` and `list-visibilities`,
+gives the next 7 days. `--execution-status` accepts `PENDING`, `EXECUTING`,
+`COMPLETE`, `CANCELED` and `ERROR`. On `list-passes` and `list-visibilities`,
 `--satellite-id` may be repeated or comma-separated to cover several satellites.
 
 `update-pass` requires `--scheduled-start` and `--scheduled-stop` together.

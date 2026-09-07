@@ -97,7 +97,7 @@ Examples:
 	cmd.Flags().
 		String("stop", "", "Latest scheduled time to include, e.g. 2026-01-22T10:00:00Z (default: 7 days after start)")
 	cmd.Flags().
-		String("execution-status", "", "Only show passes with this status (e.g. RESERVED, EXECUTING, COMPLETED)")
+		String("execution-status", "", "Only show passes with this status (PENDING, EXECUTING, COMPLETE, CANCELED, or ERROR)")
 	return cmd
 }
 
