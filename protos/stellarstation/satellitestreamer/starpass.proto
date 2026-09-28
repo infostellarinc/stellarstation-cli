@@ -316,27 +316,15 @@ message Ack {
   string message_type = 12;
 }
 
-// A message with commands to send to a satellite.
-message SendCommandsMessage {
-  // The ID of the stream sending this request. This can be considered to represent a single
-  // "connection" to the satellite. If a new stream_id comes in, requests from the previous one can
-  // be discarded. Note that a stream may be long lived, spanning multiple passes.
-  string stream_id = 1;
-
-  // The ID of the currently active pass.
-  string pass_id = 2;
-
-  // The index of this request within a stream and pass. Requests should be handled by the StarPass
-  // in order, exactly once. The first request in a pass will have index '1'.
-  uint32 index = 3;
-
-  // The commands to send in this request. Each command should be sent as an individual frame.
-  repeated bytes command = 4;
-}
-
 // A request to send commands to a satellite. Published to the pass-specific MQTT topics
 // (uplink, config_request).
 message ToStarPassMessage {
+  // Retired field numbers and names. These must not be reused. send_commands_message
+  // repeated stream_id, pass_id, index and command, so every message carried its
+  // commands twice and only half of an MQTT payload could hold command bytes.
+  reserved 5;
+  reserved "send_commands_message";
+
   // The ID of the stream sending this request. This can be considered to represent a single
   // "connection" to the satellite. If a new stream_id comes in, requests from the previous one can
   // be discarded. Note that a stream may be long lived, spanning multiple passes.
@@ -350,13 +338,13 @@ message ToStarPassMessage {
   uint32 index = 2;
 
   // The commands to send in this request. Each command should be sent as an individual frame.
+  // This is the only place commands are carried; a message published to an uplink topic with
+  // this field empty transmits nothing and is rejected.
   repeated bytes command = 3;
 
   oneof Message {
-    // A message with commands to send to the StarPass.
-    SendCommandsMessage send_commands_message = 5;
-
-    // Request to modify a ground station configuration.
+    // Request to modify a ground station configuration. Set on messages published to a
+    // config_request topic; commands carry no oneof arm.
     stellarstation.starpass.v1.GroundStationConfigurationRequest ground_station_configuration_request = 6;
   }
 

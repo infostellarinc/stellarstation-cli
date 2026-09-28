@@ -152,13 +152,13 @@ func registerOpenStreamFlags(cmd *cobra.Command, flags *flagSet) {
 		&flags.sendSatCommand,
 		"send-sat-command",
 		"",
-		"Send one satellite command as hex (for example 0A1B2C3D), then exit",
+		"Send one satellite command as hex (for example 0A1B2C3D, up to 100 KiB), then exit",
 	)
 	f.StringVar(
 		&flags.sendSatCommands,
 		"send-sat-commands",
 		"",
-		"Send several satellite commands in order (comma-separated hex), then exit",
+		"Send several satellite commands in order (comma-separated hex, up to 100 KiB each), then exit",
 	)
 	f.StringVar(&flags.sendGsConfig, "send-gs-config", "", "Send one ground-station config request (JSON), then exit")
 	f.BoolVar(&flags.interactive, "interactive", false, "Type commands to send while the pass runs")

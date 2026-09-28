@@ -260,6 +260,10 @@ command, given as hexadecimal:
 stellar satellite open-stream --pass-id <pass-id> --send-sat-command 0A1B2C3D
 ```
 
+A single command carries up to 100 KiB (102400 bytes). A larger command is
+refused before anything is transmitted, so send it as several smaller
+commands.
+
 Typing and one-shot options are not the only way to command. With `--proxy udp`
 or `--proxy tcp`, your own ground software connects to a local socket, and
 anything it sends is transmitted to the satellite while telemetry is forwarded
@@ -437,6 +441,9 @@ telemetry while you enter commands, so you can react to what the satellite sends
 during the pass. The one-shot options exit once the command has been sent, which
 suits scripted use.
 
+A satellite command carries up to 100 KiB (102400 bytes) of payload. A command
+over that size is refused and nothing is transmitted.
+
 If commanding is refused because another session holds authority, either stop
 that session or add `--override-commanding-lock`. Overriding takes authority
 immediately and the previous holder stops being able to command, so confirm
@@ -465,7 +472,8 @@ transmitted to the satellite. Uplink through the proxy uses the same commanding
 path as interactive mode: it requires an activated API key, an uplink channel on
 the pass, and commanding authority, and data is only transmitted while the pass
 is booked. Each payload received on the socket is transmitted as one satellite
-command.
+command, so your software must keep each payload within the 100 KiB
+per-command limit.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
