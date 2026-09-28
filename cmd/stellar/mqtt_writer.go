@@ -43,6 +43,14 @@ func publishCommand(
 	if err != nil {
 		return fmt.Errorf("marshal command message: %w", err)
 	}
+	// Backstop for the per-command check: the broker rejects an oversized
+	// publish, so refuse it rather than report a send that never arrived.
+	if len(wire) > mqttMaxPayloadBytes {
+		return fmt.Errorf(
+			"message is %d bytes, over the %d byte limit for a single message",
+			len(wire), mqttMaxPayloadBytes,
+		)
+	}
 
 	token := client.Publish(topic, qos, false, wire)
 	if !token.WaitTimeout(publishCommandTimeout) {
@@ -75,7 +83,8 @@ func publishCommand(
 //   - stats: Stats tracker for tracking sent commands
 //
 // Returns:
-//   - An error if the client is not connected or publishing fails
+//   - An error if the client is not connected, the commands are too large to
+//     publish, or publishing fails
 func PublishSatCommand(
 	_ context.Context, // ctx - unused but kept for API compatibility
 	client mqtt.Client,
@@ -90,12 +99,8 @@ func PublishSatCommand(
 	if !client.IsConnected() {
 		return errors.New("MQTT client not connected")
 	}
-
-	cmdMsg := &streaming.SendCommandsMessage{
-		StreamId: streamID,
-		PassId:   planID,
-		Index:    index,
-		Command:  commands,
+	if err := validateCommandSize(commands); err != nil {
+		return err
 	}
 
 	toStarPassMsg := &streaming.ToStarPassMessage{
@@ -104,9 +109,6 @@ func PublishSatCommand(
 		PassId:    planID,
 		Index:     index,
 		Command:   commands,
-		Message: &streaming.ToStarPassMessage_SendCommandsMessage{
-			SendCommandsMessage: cmdMsg,
-		},
 	}
 
 	return publishCommand(client, topic, qos, toStarPassMsg, stats, "uplink", index)

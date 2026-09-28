@@ -72,7 +72,7 @@ func TestProxyUplinkSenderTransmitsInOrder(t *testing.T) {
 		if msg.GetIndex() != uint32(i+1) {
 			t.Errorf("message %d index = %d, want %d", i, msg.GetIndex(), i+1)
 		}
-		cmds := msg.GetSendCommandsMessage().GetCommand()
+		cmds := msg.GetCommand()
 		if len(cmds) != 1 || string(cmds[0]) != string(wantCmd) {
 			t.Errorf("message %d command = %v, want %v", i, cmds, wantCmd)
 		}

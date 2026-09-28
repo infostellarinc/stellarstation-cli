@@ -1146,82 +1146,6 @@ func (x *Ack) GetMessageType() string {
 	return ""
 }
 
-// A message with commands to send to a satellite.
-type SendCommandsMessage struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// The ID of the stream sending this request. This can be considered to represent a single
-	// "connection" to the satellite. If a new stream_id comes in, requests from the previous one can
-	// be discarded. Note that a stream may be long lived, spanning multiple passes.
-	StreamId string `protobuf:"bytes,1,opt,name=stream_id,json=streamId,proto3" json:"stream_id,omitempty"`
-	// The ID of the currently active pass.
-	PassId string `protobuf:"bytes,2,opt,name=pass_id,json=passId,proto3" json:"pass_id,omitempty"`
-	// The index of this request within a stream and pass. Requests should be handled by the StarPass
-	// in order, exactly once. The first request in a pass will have index '1'.
-	Index uint32 `protobuf:"varint,3,opt,name=index,proto3" json:"index,omitempty"`
-	// The commands to send in this request. Each command should be sent as an individual frame.
-	Command       [][]byte `protobuf:"bytes,4,rep,name=command,proto3" json:"command,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *SendCommandsMessage) Reset() {
-	*x = SendCommandsMessage{}
-	mi := &file_stellarstation_satellitestreamer_starpass_proto_msgTypes[9]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *SendCommandsMessage) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*SendCommandsMessage) ProtoMessage() {}
-
-func (x *SendCommandsMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_stellarstation_satellitestreamer_starpass_proto_msgTypes[9]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use SendCommandsMessage.ProtoReflect.Descriptor instead.
-func (*SendCommandsMessage) Descriptor() ([]byte, []int) {
-	return file_stellarstation_satellitestreamer_starpass_proto_rawDescGZIP(), []int{9}
-}
-
-func (x *SendCommandsMessage) GetStreamId() string {
-	if x != nil {
-		return x.StreamId
-	}
-	return ""
-}
-
-func (x *SendCommandsMessage) GetPassId() string {
-	if x != nil {
-		return x.PassId
-	}
-	return ""
-}
-
-func (x *SendCommandsMessage) GetIndex() uint32 {
-	if x != nil {
-		return x.Index
-	}
-	return 0
-}
-
-func (x *SendCommandsMessage) GetCommand() [][]byte {
-	if x != nil {
-		return x.Command
-	}
-	return nil
-}
-
 // A request to send commands to a satellite. Published to the pass-specific MQTT topics
 // (uplink, config_request).
 type ToStarPassMessage struct {
@@ -1236,10 +1160,11 @@ type ToStarPassMessage struct {
 	// in order, exactly once. The first request in a pass will have index '1'.
 	Index uint32 `protobuf:"varint,2,opt,name=index,proto3" json:"index,omitempty"`
 	// The commands to send in this request. Each command should be sent as an individual frame.
+	// This is the only place commands are carried; a message published to an uplink topic with
+	// this field empty transmits nothing and is rejected.
 	Command [][]byte `protobuf:"bytes,3,rep,name=command,proto3" json:"command,omitempty"`
 	// Types that are valid to be assigned to Message:
 	//
-	//	*ToStarPassMessage_SendCommandsMessage
 	//	*ToStarPassMessage_GroundStationConfigurationRequest
 	Message isToStarPassMessage_Message `protobuf_oneof:"Message"`
 	// Unique ID of this message (UUID v4), set by the sender when the message is
@@ -1252,7 +1177,7 @@ type ToStarPassMessage struct {
 
 func (x *ToStarPassMessage) Reset() {
 	*x = ToStarPassMessage{}
-	mi := &file_stellarstation_satellitestreamer_starpass_proto_msgTypes[10]
+	mi := &file_stellarstation_satellitestreamer_starpass_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1264,7 +1189,7 @@ func (x *ToStarPassMessage) String() string {
 func (*ToStarPassMessage) ProtoMessage() {}
 
 func (x *ToStarPassMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_stellarstation_satellitestreamer_starpass_proto_msgTypes[10]
+	mi := &file_stellarstation_satellitestreamer_starpass_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1277,7 +1202,7 @@ func (x *ToStarPassMessage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ToStarPassMessage.ProtoReflect.Descriptor instead.
 func (*ToStarPassMessage) Descriptor() ([]byte, []int) {
-	return file_stellarstation_satellitestreamer_starpass_proto_rawDescGZIP(), []int{10}
+	return file_stellarstation_satellitestreamer_starpass_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *ToStarPassMessage) GetStreamId() string {
@@ -1315,15 +1240,6 @@ func (x *ToStarPassMessage) GetMessage() isToStarPassMessage_Message {
 	return nil
 }
 
-func (x *ToStarPassMessage) GetSendCommandsMessage() *SendCommandsMessage {
-	if x != nil {
-		if x, ok := x.Message.(*ToStarPassMessage_SendCommandsMessage); ok {
-			return x.SendCommandsMessage
-		}
-	}
-	return nil
-}
-
 func (x *ToStarPassMessage) GetGroundStationConfigurationRequest() *v1.GroundStationConfigurationRequest {
 	if x != nil {
 		if x, ok := x.Message.(*ToStarPassMessage_GroundStationConfigurationRequest); ok {
@@ -1344,17 +1260,11 @@ type isToStarPassMessage_Message interface {
 	isToStarPassMessage_Message()
 }
 
-type ToStarPassMessage_SendCommandsMessage struct {
-	// A message with commands to send to the StarPass.
-	SendCommandsMessage *SendCommandsMessage `protobuf:"bytes,5,opt,name=send_commands_message,json=sendCommandsMessage,proto3,oneof"`
-}
-
 type ToStarPassMessage_GroundStationConfigurationRequest struct {
-	// Request to modify a ground station configuration.
+	// Request to modify a ground station configuration. Set on messages published to a
+	// config_request topic; commands carry no oneof arm.
 	GroundStationConfigurationRequest *v1.GroundStationConfigurationRequest `protobuf:"bytes,6,opt,name=ground_station_configuration_request,json=groundStationConfigurationRequest,proto3,oneof"`
 }
-
-func (*ToStarPassMessage_SendCommandsMessage) isToStarPassMessage_Message() {}
 
 func (*ToStarPassMessage_GroundStationConfigurationRequest) isToStarPassMessage_Message() {}
 
@@ -1460,22 +1370,16 @@ const file_stellarstation_satellitestreamer_starpass_proto_rawDesc = "" +
 	"\fmessage_type\x18\f \x01(\tR\vmessageType\"\x1b\n" +
 	"\x06Status\x12\a\n" +
 	"\x03ACK\x10\x00\x12\b\n" +
-	"\x04NACK\x10\x01\"{\n" +
-	"\x13SendCommandsMessage\x12\x1b\n" +
-	"\tstream_id\x18\x01 \x01(\tR\bstreamId\x12\x17\n" +
-	"\apass_id\x18\x02 \x01(\tR\x06passId\x12\x14\n" +
-	"\x05index\x18\x03 \x01(\rR\x05index\x12\x18\n" +
-	"\acommand\x18\x04 \x03(\fR\acommand\"\xac\x03\n" +
+	"\x04NACK\x10\x01\"\xd3\x02\n" +
 	"\x11ToStarPassMessage\x12\x1b\n" +
 	"\tstream_id\x18\x01 \x01(\tR\bstreamId\x12\x17\n" +
 	"\apass_id\x18\x04 \x01(\tR\x06passId\x12\x14\n" +
 	"\x05index\x18\x02 \x01(\rR\x05index\x12\x18\n" +
-	"\acommand\x18\x03 \x03(\fR\acommand\x12t\n" +
-	"\x15send_commands_message\x18\x05 \x01(\v2>.stellarstation.satellitestreamer.messages.SendCommandsMessageH\x00R\x13sendCommandsMessage\x12\x90\x01\n" +
+	"\acommand\x18\x03 \x03(\fR\acommand\x12\x90\x01\n" +
 	"$ground_station_configuration_request\x18\x06 \x01(\v2=.stellarstation.starpass.v1.GroundStationConfigurationRequestH\x00R!groundStationConfigurationRequest\x12\x1d\n" +
 	"\n" +
 	"message_id\x18\a \x01(\tR\tmessageIdB\t\n" +
-	"\aMessageB\xc2\x02\n" +
+	"\aMessageJ\x04\b\x05\x10\x06R\x15send_commands_messageB\xc2\x02\n" +
 	"-com.stellarstation.satellitestreamer.messagesB\rStarpassProtoP\x01Z<stellarstation/generated/pb/stellarstation/satellitestreamer\xa2\x02\x03SSM\xaa\x02)Stellarstation.Satellitestreamer.Messages\xca\x02)Stellarstation\\Satellitestreamer\\Messages\xe2\x025Stellarstation\\Satellitestreamer\\Messages\\GPBMetadata\xea\x02+Stellarstation::Satellitestreamer::Messagesb\x06proto3"
 
 var (
@@ -1491,7 +1395,7 @@ func file_stellarstation_satellitestreamer_starpass_proto_rawDescGZIP() []byte {
 }
 
 var file_stellarstation_satellitestreamer_starpass_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_stellarstation_satellitestreamer_starpass_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
+var file_stellarstation_satellitestreamer_starpass_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
 var file_stellarstation_satellitestreamer_starpass_proto_goTypes = []any{
 	(IqFormat_Encoding)(0),                        // 0: stellarstation.satellitestreamer.messages.IqFormat.Encoding
 	(SendTelemetryMessage_Type)(0),                // 1: stellarstation.satellitestreamer.messages.SendTelemetryMessage.Type
@@ -1505,43 +1409,41 @@ var file_stellarstation_satellitestreamer_starpass_proto_goTypes = []any{
 	(*EventMessage)(nil),                          // 9: stellarstation.satellitestreamer.messages.EventMessage
 	(*FromStarPassMessage)(nil),                   // 10: stellarstation.satellitestreamer.messages.FromStarPassMessage
 	(*Ack)(nil),                                   // 11: stellarstation.satellitestreamer.messages.Ack
-	(*SendCommandsMessage)(nil),                   // 12: stellarstation.satellitestreamer.messages.SendCommandsMessage
-	(*ToStarPassMessage)(nil),                     // 13: stellarstation.satellitestreamer.messages.ToStarPassMessage
-	(v1.Framing)(0),                               // 14: stellarstation.starpass.v1.Framing
-	(*timestamppb.Timestamp)(nil),                 // 15: google.protobuf.Timestamp
-	(*monitoring.GroundStationState)(nil),         // 16: stellarstation.starpass.v1.monitoring.GroundStationState
-	(*monitoring.GroundStationConfiguration)(nil), // 17: stellarstation.starpass.v1.monitoring.GroundStationConfiguration
-	(*monitoring.GroundStationEvent)(nil),         // 18: stellarstation.starpass.v1.monitoring.GroundStationEvent
-	(*v1.GroundStationConfigurationRequest)(nil),  // 19: stellarstation.starpass.v1.GroundStationConfigurationRequest
+	(*ToStarPassMessage)(nil),                     // 12: stellarstation.satellitestreamer.messages.ToStarPassMessage
+	(v1.Framing)(0),                               // 13: stellarstation.starpass.v1.Framing
+	(*timestamppb.Timestamp)(nil),                 // 14: google.protobuf.Timestamp
+	(*monitoring.GroundStationState)(nil),         // 15: stellarstation.starpass.v1.monitoring.GroundStationState
+	(*monitoring.GroundStationConfiguration)(nil), // 16: stellarstation.starpass.v1.monitoring.GroundStationConfiguration
+	(*monitoring.GroundStationEvent)(nil),         // 17: stellarstation.starpass.v1.monitoring.GroundStationEvent
+	(*v1.GroundStationConfigurationRequest)(nil),  // 18: stellarstation.starpass.v1.GroundStationConfigurationRequest
 }
 var file_stellarstation_satellitestreamer_starpass_proto_depIdxs = []int32{
 	0,  // 0: stellarstation.satellitestreamer.messages.IqFormat.encoding:type_name -> stellarstation.satellitestreamer.messages.IqFormat.Encoding
-	14, // 1: stellarstation.satellitestreamer.messages.Telemetry.framing:type_name -> stellarstation.starpass.v1.Framing
-	15, // 2: stellarstation.satellitestreamer.messages.Telemetry.timeFirstByteReceived:type_name -> google.protobuf.Timestamp
-	15, // 3: stellarstation.satellitestreamer.messages.Telemetry.timeLastByteReceived:type_name -> google.protobuf.Timestamp
+	13, // 1: stellarstation.satellitestreamer.messages.Telemetry.framing:type_name -> stellarstation.starpass.v1.Framing
+	14, // 2: stellarstation.satellitestreamer.messages.Telemetry.timeFirstByteReceived:type_name -> google.protobuf.Timestamp
+	14, // 3: stellarstation.satellitestreamer.messages.Telemetry.timeLastByteReceived:type_name -> google.protobuf.Timestamp
 	3,  // 4: stellarstation.satellitestreamer.messages.Telemetry.iq_format:type_name -> stellarstation.satellitestreamer.messages.IqFormat
 	4,  // 5: stellarstation.satellitestreamer.messages.Telemetry.decimation:type_name -> stellarstation.satellitestreamer.messages.DecimationCompressionParams
 	1,  // 6: stellarstation.satellitestreamer.messages.SendTelemetryMessage.type:type_name -> stellarstation.satellitestreamer.messages.SendTelemetryMessage.Type
 	5,  // 7: stellarstation.satellitestreamer.messages.SendTelemetryMessage.telemetry:type_name -> stellarstation.satellitestreamer.messages.Telemetry
-	15, // 8: stellarstation.satellitestreamer.messages.MonitoringMessage.recorded_at:type_name -> google.protobuf.Timestamp
-	16, // 9: stellarstation.satellitestreamer.messages.MonitoringMessage.state:type_name -> stellarstation.starpass.v1.monitoring.GroundStationState
-	15, // 10: stellarstation.satellitestreamer.messages.ConfigurationMessage.recorded_at:type_name -> google.protobuf.Timestamp
-	17, // 11: stellarstation.satellitestreamer.messages.ConfigurationMessage.configuration:type_name -> stellarstation.starpass.v1.monitoring.GroundStationConfiguration
-	15, // 12: stellarstation.satellitestreamer.messages.EventMessage.recorded_at:type_name -> google.protobuf.Timestamp
-	18, // 13: stellarstation.satellitestreamer.messages.EventMessage.event:type_name -> stellarstation.starpass.v1.monitoring.GroundStationEvent
+	14, // 8: stellarstation.satellitestreamer.messages.MonitoringMessage.recorded_at:type_name -> google.protobuf.Timestamp
+	15, // 9: stellarstation.satellitestreamer.messages.MonitoringMessage.state:type_name -> stellarstation.starpass.v1.monitoring.GroundStationState
+	14, // 10: stellarstation.satellitestreamer.messages.ConfigurationMessage.recorded_at:type_name -> google.protobuf.Timestamp
+	16, // 11: stellarstation.satellitestreamer.messages.ConfigurationMessage.configuration:type_name -> stellarstation.starpass.v1.monitoring.GroundStationConfiguration
+	14, // 12: stellarstation.satellitestreamer.messages.EventMessage.recorded_at:type_name -> google.protobuf.Timestamp
+	17, // 13: stellarstation.satellitestreamer.messages.EventMessage.event:type_name -> stellarstation.starpass.v1.monitoring.GroundStationEvent
 	6,  // 14: stellarstation.satellitestreamer.messages.FromStarPassMessage.send_telemetry_message:type_name -> stellarstation.satellitestreamer.messages.SendTelemetryMessage
 	7,  // 15: stellarstation.satellitestreamer.messages.FromStarPassMessage.monitoring_message:type_name -> stellarstation.satellitestreamer.messages.MonitoringMessage
 	8,  // 16: stellarstation.satellitestreamer.messages.FromStarPassMessage.configuration_message:type_name -> stellarstation.satellitestreamer.messages.ConfigurationMessage
 	9,  // 17: stellarstation.satellitestreamer.messages.FromStarPassMessage.event_message:type_name -> stellarstation.satellitestreamer.messages.EventMessage
 	2,  // 18: stellarstation.satellitestreamer.messages.Ack.status:type_name -> stellarstation.satellitestreamer.messages.Ack.Status
-	15, // 19: stellarstation.satellitestreamer.messages.Ack.received_at:type_name -> google.protobuf.Timestamp
-	12, // 20: stellarstation.satellitestreamer.messages.ToStarPassMessage.send_commands_message:type_name -> stellarstation.satellitestreamer.messages.SendCommandsMessage
-	19, // 21: stellarstation.satellitestreamer.messages.ToStarPassMessage.ground_station_configuration_request:type_name -> stellarstation.starpass.v1.GroundStationConfigurationRequest
-	22, // [22:22] is the sub-list for method output_type
-	22, // [22:22] is the sub-list for method input_type
-	22, // [22:22] is the sub-list for extension type_name
-	22, // [22:22] is the sub-list for extension extendee
-	0,  // [0:22] is the sub-list for field type_name
+	14, // 19: stellarstation.satellitestreamer.messages.Ack.received_at:type_name -> google.protobuf.Timestamp
+	18, // 20: stellarstation.satellitestreamer.messages.ToStarPassMessage.ground_station_configuration_request:type_name -> stellarstation.starpass.v1.GroundStationConfigurationRequest
+	21, // [21:21] is the sub-list for method output_type
+	21, // [21:21] is the sub-list for method input_type
+	21, // [21:21] is the sub-list for extension type_name
+	21, // [21:21] is the sub-list for extension extendee
+	0,  // [0:21] is the sub-list for field type_name
 }
 
 func init() { file_stellarstation_satellitestreamer_starpass_proto_init() }
@@ -1558,8 +1460,7 @@ func file_stellarstation_satellitestreamer_starpass_proto_init() {
 		(*FromStarPassMessage_ConfigurationMessage)(nil),
 		(*FromStarPassMessage_EventMessage)(nil),
 	}
-	file_stellarstation_satellitestreamer_starpass_proto_msgTypes[10].OneofWrappers = []any{
-		(*ToStarPassMessage_SendCommandsMessage)(nil),
+	file_stellarstation_satellitestreamer_starpass_proto_msgTypes[9].OneofWrappers = []any{
 		(*ToStarPassMessage_GroundStationConfigurationRequest)(nil),
 	}
 	type x struct{}
@@ -1568,7 +1469,7 @@ func file_stellarstation_satellitestreamer_starpass_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_stellarstation_satellitestreamer_starpass_proto_rawDesc), len(file_stellarstation_satellitestreamer_starpass_proto_rawDesc)),
 			NumEnums:      3,
-			NumMessages:   11,
+			NumMessages:   10,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

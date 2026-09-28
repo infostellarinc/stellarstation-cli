@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"crypto/tls"
 	"encoding/hex"
@@ -217,6 +216,11 @@ func createSendSatCommandFunc(
 		cmdBytes, err := parseHexCommand(cmdHex)
 		if err != nil {
 			return fmt.Errorf("invalid hex command %q: %w", cmdHex, err)
+		}
+		// Checked before the echo below, so an oversized payload is never
+		// reported as being sent.
+		if err := validateCommandSize([][]byte{cmdBytes}); err != nil {
+			return err
 		}
 		//nolint:gosec // G706: cmdHex is a trusted hex-encoded command from user input
 		uiDataf(kindUplink, "sending command %d: %s (%d bytes)", index, cmdHex, len(cmdBytes))
@@ -498,7 +502,7 @@ func runInteractiveMode(
 	s := newInteractiveSession(cfg, targets, client, streamID, planID, stats, window)
 	s.printBanner(passID)
 
-	scanner := bufio.NewScanner(os.Stdin)
+	scanner := newCommandScanner(os.Stdin)
 	for {
 		select {
 		case <-ctx.Done():
@@ -710,6 +714,10 @@ func (s *interactiveSession) sendSatCommand(ctx context.Context, args []string) 
 	cmdBytes, err := parseHexCommand(hexPayload)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: invalid hex: %v\n", err)
+		return
+	}
+	if err := validateCommandSize([][]byte{cmdBytes}); err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 		return
 	}
 	idx := s.satIndices[chIdx]
