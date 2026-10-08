@@ -1469,12 +1469,29 @@ func setupMQTTClientAndConfig(
 	return connectMQTTClientForReader(ctx, cfg, connCfg)
 }
 
-// connectMQTTClientForReader establishes a new MQTT connection for the reader.
+// connectMQTTClientForReader establishes the reader's telemetry MQTT connection.
 func connectMQTTClientForReader(
 	ctx context.Context,
 	cfg Config,
 	connCfg *mqttConnectionConfig,
 ) (mqtt.Client, *mqttConnectionConfig, error) {
+	connectedClient, err := connectReaderClient(ctx, cfg, connCfg)
+	if err != nil {
+		log.Printf("WARNING: Failed to connect to MQTT broker after retries: %v", err)
+		log.Printf("  Continuing with S3 fallback only")
+		connCfg.topics = []string{}
+		return nil, connCfg, nil
+	}
+	return connectedClient, connCfg, nil
+}
+
+// connectReaderClient connects one reader MQTT connection, re-reading the
+// certificate from the credential store on every attempt.
+func connectReaderClient(
+	ctx context.Context,
+	cfg Config,
+	connCfg *mqttConnectionConfig,
+) (mqtt.Client, error) {
 	connectConfirmed := make(chan struct{})
 	clientFactory := func() (mqtt.Client, string, error) {
 		var creds *AuthorizerCredentials
@@ -1506,15 +1523,61 @@ func connectMQTTClientForReader(
 		opts := buildMQTTClientOptions(connCfg, connectConfirmed)
 		return mqtt.NewClient(opts), connCfg.broker, nil
 	}
+	return connectMQTTClientWithRetry(ctx, clientFactory, connectConfirmed, connCfg)
+}
 
-	connectedClient, err := connectMQTTClientWithRetry(ctx, clientFactory, connectConfirmed, connCfg)
+// connectCommandAckClient opens the reader's second MQTT connection, which
+// carries only the command ack topics.
+//
+// AWS IoT Core caps each connection at 512 KB/s and delays whatever exceeds
+// it. Once low-rate telemetry fills the telemetry connection, an ack queued
+// on it fails to deliver and the broker retries the QoS 1 publish about two
+// seconds later, which turned 100 ms command round trips into 2 to 5 s. On
+// its own connection an ack never waits behind telemetry.
+//
+// Returns nil when the connection cannot be opened; the caller then keeps the
+// acks on the telemetry connection, slower but not lossy.
+func connectCommandAckClient(
+	ctx context.Context,
+	cfg Config,
+	connCfg *mqttConnectionConfig,
+	ackTopics []string,
+) mqtt.Client {
+	ackCfg := *connCfg
+	ackCfg.topics = ackTopics
+	ackCfg.clientID = resolveMQTTClientID(cfg.AuthorizerCreds.ClientID)
+	client, err := connectReaderClient(ctx, cfg, &ackCfg)
 	if err != nil {
-		log.Printf("WARNING: Failed to connect to MQTT broker after retries: %v", err)
-		log.Printf("  Continuing with S3 fallback only")
-		connCfg.topics = []string{}
-		return nil, connCfg, nil
+		log.Printf("WARNING: Could not open a separate MQTT connection for command acks (%v); acks share the telemetry connection", err)
+		return nil
 	}
-	return connectedClient, connCfg, nil
+	vlogf("Command acks use their own MQTT connection (clientId=%s)", ackCfg.clientID)
+	return client
+}
+
+// splitCommandAckTopics separates the command ack subscriptions from the
+// telemetry, monitoring, config and event ones, preserving order.
+func splitCommandAckTopics(topics []string) (telemetry, acks []string) {
+	for _, t := range topics {
+		if strings.HasSuffix(t, "/ack") {
+			acks = append(acks, t)
+		} else {
+			telemetry = append(telemetry, t)
+		}
+	}
+	return telemetry, acks
+}
+
+// subscribeCommandAcks subscribes the command ack topics on ackClient. A
+// failure is logged rather than fatal: telemetry still flows, and the
+// interactive session reports the missing acks itself.
+func subscribeCommandAcks(ackClient mqtt.Client, ackTopics []string, qos byte, handler mqtt.MessageHandler) {
+	if ackClient == nil || len(ackTopics) == 0 {
+		return
+	}
+	if err := subscribeMQTT(ackClient, ackTopics, qos, handler); err != nil {
+		log.Printf("WARNING: Failed to subscribe to command ack topics: %v", err)
+	}
 }
 
 func runMQTTReaderWithClient(
@@ -1535,6 +1598,18 @@ func runMQTTReaderWithClient(
 	if client != nil && sharedClient == nil {
 		defer client.Disconnect(mqttDisconnectQuiesce)
 		defer msgAckSender.Flush()
+	}
+
+	// Command acks get their own connection (see connectCommandAckClient); the
+	// telemetry connection keeps everything else.
+	var ackTopics []string
+	connCfg.topics, ackTopics = splitCommandAckTopics(connCfg.topics)
+	ackClient := client
+	if client != nil && sharedClient == nil && len(ackTopics) > 0 {
+		if dedicated := connectCommandAckClient(ctx, cfg, connCfg, ackTopics); dedicated != nil {
+			ackClient = dedicated
+			defer dedicated.Disconnect(mqttDisconnectQuiesce)
+		}
 	}
 
 	// mqttResultsChBuf sizes each CHANNEL's own inbound queue (see
@@ -1597,6 +1672,7 @@ func runMQTTReaderWithClient(
 	hasMQTTFeatures := cfg.EnableDownlink || cfg.EnableMonitoring || cfg.EnableConfigState ||
 		cfg.EnableEvent
 
+	subscribeCommandAcks(ackClient, ackTopics, cfg.MQTTQoS, messageHandler)
 	if err := subscribeOrFallback(client, connCfg, cfg, hasMQTTFeatures, s3c, messageHandler); err != nil {
 		return err
 	}
