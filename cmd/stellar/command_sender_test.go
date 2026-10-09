@@ -742,6 +742,8 @@ type mockMQTTClient struct {
 	pubTopic   string
 	pubQoS     byte
 	pubPayload []byte
+	subscribed []string // topics passed to Subscribe, in call order
+	subQoS     byte
 }
 
 func (m *mockMQTTClient) IsConnected() bool {
@@ -768,6 +770,8 @@ func (m *mockMQTTClient) Subscribe(
 	qos byte,
 	callback mqtt.MessageHandler,
 ) mqtt.Token {
+	m.subscribed = append(m.subscribed, topic)
+	m.subQoS = qos
 	return &mockToken{err: nil}
 }
 
