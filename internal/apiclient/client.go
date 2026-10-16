@@ -187,11 +187,17 @@ func (c *Client) ListVisibilities(ctx context.Context, opts ListVisibilitiesOpts
 	if len(opts.SatelliteIDs) > 0 {
 		q.Set("satellite_ids", strings.Join(opts.SatelliteIDs, ","))
 	}
+	if len(opts.GroundStationIDs) > 0 {
+		q.Set("ground_station_ids", strings.Join(opts.GroundStationIDs, ","))
+	}
 	if opts.Start != nil {
 		q.Set("start", opts.Start.Format(time.RFC3339))
 	}
 	if opts.Stop != nil {
 		q.Set("stop", opts.Stop.Format(time.RFC3339))
+	}
+	if opts.MinMaxElevationDegrees != nil {
+		q.Set("min_max_elevation_degrees", strconv.FormatFloat(*opts.MinMaxElevationDegrees, 'f', -1, 64))
 	}
 
 	var visibilities []Visibility

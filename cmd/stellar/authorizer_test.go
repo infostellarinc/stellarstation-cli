@@ -138,6 +138,31 @@ func TestFetchAuthorizerCredentials_ErrorResponses(t *testing.T) {
 		}
 	})
 
+	t.Run("409 stream limit carries its code", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).
+				Encode(map[string]string{"error": "stream_limit_reached", "message": "this pass already has 1 open stream(s)"})
+		}))
+		defer server.Close()
+		_, err := fetchAuthorizerCredentials(
+			t.Context(),
+			server.URL,
+			testTokenSource(),
+			AuthorizerRequest{PassID: "pass-123"},
+		)
+		if !isAuthorizerError(err, authorizerErrorStreamLimitReached) {
+			t.Fatalf("expected a stream_limit_reached authorizer error, got %v", err)
+		}
+		if isAuthorizerError(err, "commanding_conflict") {
+			t.Fatalf("error code must be matched exactly, got %v", err)
+		}
+		if want := "this pass already has 1 open stream(s) (status 409)"; err.Error() != want {
+			t.Fatalf("error = %q, want %q", err.Error(), want)
+		}
+	})
+
 	t.Run("missing credentials", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "application/json")

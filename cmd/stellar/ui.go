@@ -382,6 +382,8 @@ func uiErrf(format string, a ...interface{}) {
 	emitLine(paint(ui.red, "Error: "+fmt.Sprintf(format, a...)))
 }
 
+// uiInfof is printf-style like uiWarnf and uiErrf; today's callers pass
+// constant hints, but the arguments are part of the helper family's shape.
 func uiInfof(format string, a ...interface{}) {
 	initUI()
 	emitLine("  " + fmt.Sprintf(format, a...))
