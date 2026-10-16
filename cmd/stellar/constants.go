@@ -92,9 +92,11 @@ const (
 	idleShutdownPoll = 1 * time.Second
 
 	// idleShutdownInactivityDelay is how long the stream must stay quiet (past pass
-	// end) before the close countdown is even announced. This avoids warning the
-	// operator the instant the pass ends: only after this much continuous
-	// inactivity do we surface "closing in 60 seconds...".
+	// end) before the close countdown is even announced, at the default
+	// --idle-timeout. This avoids warning the operator the instant the pass ends:
+	// only after this much continuous inactivity do we surface "closing in 60
+	// seconds...". See idleShutdownScheduleFor for how a non-default timeout
+	// changes it.
 	idleShutdownInactivityDelay = 60 * time.Second
 
 	// idleShutdownWarn60/30/10 are the "stream will close in N seconds" warning
@@ -106,6 +108,11 @@ const (
 	idleShutdownGrace  = 60 * time.Second
 	idleShutdownWarn30 = 30 * time.Second
 	idleShutdownWarn10 = 10 * time.Second
+
+	// defaultIdleTimeout is the default --idle-timeout: the total idle time, past
+	// pass end, after which the stream closes. It is the inactivity delay plus the
+	// countdown, so the default flag reproduces the original fixed timings.
+	defaultIdleTimeout = idleShutdownInactivityDelay + idleShutdownGrace
 )
 
 // Credential and retry timing.

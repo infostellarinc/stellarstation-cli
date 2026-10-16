@@ -59,6 +59,7 @@ type flagSet struct {
 	enableVerbose          bool
 	enableDebug            bool
 	enableAutoClose        bool
+	idleTimeout            time.Duration
 	overrideCommandingLock bool
 	acceptedFraming        string
 
@@ -201,6 +202,13 @@ func registerOpenStreamFlags(cmd *cobra.Command, flags *flagSet) {
 		"enable-auto-close",
 		false,
 		"Stop automatically when the satellite signals end-of-data",
+	)
+	f.DurationVar(
+		&flags.idleTimeout,
+		"idle-timeout",
+		defaultIdleTimeout,
+		"Close the stream once it has been idle this long after the pass ends, "+
+			"warning before it closes (0 keeps it open until Ctrl-C)",
 	)
 	f.BoolVar(
 		&flags.overrideCommandingLock,
@@ -356,6 +364,11 @@ func validateBasicFlags(flags *flagSet) {
 	}
 	if flags.mqttQoS < 0 || flags.mqttQoS > 2 {
 		streamUsageFatal(fmt.Sprintf("--mqtt-qos must be 0, 1, or 2 (you gave %d).", flags.mqttQoS))
+	}
+	if flags.idleTimeout < 0 {
+		streamUsageFatal(
+			fmt.Sprintf("--idle-timeout must be 0 or a positive duration (you gave %s).", flags.idleTimeout),
+		)
 	}
 }
 
@@ -834,15 +847,61 @@ func resolvePassEndTime(ctx context.Context, flags *flagSet, passID string) time
 	return end
 }
 
+// idleShutdownSchedule is the timing the idle-shutdown monitor runs on. It is
+// derived from --idle-timeout by idleShutdownScheduleFor.
+type idleShutdownSchedule struct {
+	// inactivityDelay is how long the stream must stay quiet past pass end before
+	// the close countdown is announced.
+	inactivityDelay time.Duration
+	// grace is the countdown from the announcement to the close.
+	grace time.Duration
+	// warnings are the further warnings printed during the countdown, most
+	// distant from the close first.
+	warnings []idleShutdownWarning
+}
+
+// idleShutdownWarning is one "closing in N seconds" warning, printed when that
+// much time remains before the close.
+type idleShutdownWarning struct {
+	remaining time.Duration
+	severity  int // see uiCountdownf
+}
+
+// idleShutdownScheduleFor derives the monitor's timings from --idle-timeout, the
+// total idle time past pass end after which the stream closes. The warnings keep
+// their fixed distance from the close: the countdown is announced 60 seconds
+// before it, with further warnings at 30 and 10, and the inactivity delay absorbs
+// the rest, so the default timeout reproduces the original 60 s delay + 60 s
+// countdown. A timeout shorter than the countdown cannot fit those, so the
+// countdown is announced as soon as the stream is idle and runs for the whole
+// timeout, with a single warning at its halfway point.
+func idleShutdownScheduleFor(timeout time.Duration) idleShutdownSchedule {
+	if timeout >= idleShutdownGrace {
+		return idleShutdownSchedule{
+			inactivityDelay: timeout - idleShutdownGrace,
+			grace:           idleShutdownGrace,
+			warnings: []idleShutdownWarning{
+				{remaining: idleShutdownWarn30, severity: 1},
+				{remaining: idleShutdownWarn10, severity: 2},
+			},
+		}
+	}
+	return idleShutdownSchedule{
+		grace:    timeout,
+		warnings: []idleShutdownWarning{{remaining: timeout / 2, severity: 2}},
+	}
+}
+
 // startIdleShutdownMonitor watches a live stream and gracefully closes it once
 // BOTH conditions hold: the pass has ended (now is past the latest of its
 // scheduled/visibility/booking stop) AND no message of any kind has been sent or
 // received since the previous sample (the stream has gone quiet). After the pass
-// ends it waits idleShutdownInactivityDelay of continuous inactivity before
-// announcing the close, then counts down with escalating, colored warnings at
-// 60/30/10 seconds and cancels the run context, which drives the normal
+// ends it waits out the schedule's inactivity delay of continuous inactivity
+// before announcing the close, then counts down with escalating, colored
+// warnings (at 60/30/10 seconds before the close by default; see
+// idleShutdownScheduleFor) and cancels the run context, which drives the normal
 // graceful-shutdown path. Any activity resets it: it waits out the inactivity
-// delay again the next time the stream falls idle.
+// delay again the next time the stream falls idle. --idle-timeout 0 disables it.
 //
 // The pass end time is resolved inside the goroutine so stream startup is never
 // blocked on the pass fetch; when it cannot be resolved the monitor simply
@@ -851,13 +910,18 @@ func startIdleShutdownMonitor(
 	ctx context.Context, cancel context.CancelFunc, flags *flagSet,
 	passID string, stats *statsTracker, idleClosed *atomic.Bool,
 ) {
+	if flags.idleTimeout <= 0 {
+		vlogf("idle-shutdown: disabled (--idle-timeout 0); the stream stays open until Ctrl-C")
+		return
+	}
+	schedule := idleShutdownScheduleFor(flags.idleTimeout)
 	go func() {
 		endTime := resolvePassEndTime(ctx, flags, passID)
 		if endTime.IsZero() {
 			return
 		}
-		vlogf("idle-shutdown: armed; auto-close when idle after pass end %s",
-			endTime.UTC().Format(time.RFC3339))
+		vlogf("idle-shutdown: armed; auto-close when idle for %s after pass end %s",
+			flags.idleTimeout, endTime.UTC().Format(time.RFC3339))
 
 		ticker := time.NewTicker(idleShutdownPoll)
 		defer ticker.Stop()
@@ -865,7 +929,7 @@ func startIdleShutdownMonitor(
 		lastCount := stats.ActivityCount()
 		var idleSince time.Time // zero == active/not yet idle after pass end
 		var deadline time.Time  // zero == countdown not armed
-		warned30, warned10 := false, false
+		nextWarning := 0        // index into schedule.warnings of the next one to print
 
 		for {
 			select {
@@ -886,48 +950,62 @@ func startIdleShutdownMonitor(
 				}
 				idleSince = time.Time{}
 				deadline = time.Time{}
-				warned30, warned10 = false, false
+				nextWarning = 0
 				continue
 			}
 
-			// Past the pass end and quiet. Require idleShutdownInactivityDelay of
+			// Past the pass end and quiet. Require the inactivity delay of
 			// continuous inactivity before announcing/arming the close countdown, so
 			// the operator is not warned the instant the pass ends.
 			if idleSince.IsZero() {
 				idleSince = now
 				continue
 			}
-			if now.Sub(idleSince) < idleShutdownInactivityDelay {
+			if now.Sub(idleSince) < schedule.inactivityDelay {
 				continue
 			}
 
 			// Inactivity threshold reached: arm the countdown on the first qualifying tick.
 			if deadline.IsZero() {
-				deadline = now.Add(idleShutdownGrace)
-				warned30, warned10 = false, false
+				deadline = now.Add(schedule.grace)
+				nextWarning = 0
 				uiCountdownf(
 					0,
 					"Pass has ended and the stream is idle - closing in %d seconds unless activity resumes.",
-					int(idleShutdownGrace.Seconds()),
+					int(schedule.grace.Seconds()),
 				)
 				continue
 			}
 
-			switch remaining := time.Until(deadline); {
-			case remaining <= 0:
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
 				idleClosed.Store(true)
 				uiCountdownf(2, "No activity since the pass ended - closing the stream now.")
 				cancel()
 				return
-			case remaining <= idleShutdownWarn10 && !warned10:
-				warned10 = true
-				uiCountdownf(2, "Closing the stream in 10 seconds (no activity since the pass ended).")
-			case remaining <= idleShutdownWarn30 && !warned30:
-				warned30 = true
-				uiCountdownf(1, "Closing the stream in 30 seconds (no activity since the pass ended).")
+			}
+			// Print the most urgent warning whose threshold has been crossed, and
+			// skip any less urgent ones crossed in the same tick.
+			if i := crossedIdleWarning(schedule.warnings, nextWarning, remaining); i >= 0 {
+				nextWarning = i + 1
+				w := schedule.warnings[i]
+				uiCountdownf(w.severity, "Closing the stream in %d seconds (no activity since the pass ended).",
+					int(w.remaining.Seconds()))
 			}
 		}
 	}()
+}
+
+// crossedIdleWarning returns the index of the most urgent warning at or after
+// next whose threshold remaining has reached, or -1 when none has.
+func crossedIdleWarning(warnings []idleShutdownWarning, next int, remaining time.Duration) int {
+	crossed := -1
+	for i := next; i < len(warnings); i++ {
+		if remaining <= warnings[i].remaining {
+			crossed = i
+		}
+	}
+	return crossed
 }
 
 func waitForCompletion(
@@ -1181,7 +1259,12 @@ func fetchAndApplyAuthorizerCredentials(
 	if err != nil {
 		stopSpinner()
 		uiErrf("Could not set up this pass: %v", err)
-		uiInfof("Check the pass ID is correct and that your API key has access to it.")
+		if isAuthorizerError(err, authorizerErrorStreamLimitReached) {
+			uiInfof("This pass is already open in as many clients as its configuration allows. " +
+				"Close one of the other streams, then try again.")
+		} else {
+			uiInfof("Check the pass ID is correct and that your API key has access to it.")
+		}
 		os.Exit(1)
 	}
 	stopSpinner()
@@ -1588,9 +1671,10 @@ func runOpenStream(cmd *cobra.Command, flags *flagSet) error {
 	startHighRateReader(ctx, cfg, s3c, stats, &wg, errCh)
 	startMQTTReader(ctx, cfg, s3c, stats, &wg, errCh)
 	startInteractiveCommandSender(ctx, flags, cfg, effectivePassID, stats, &wg, errCh, statsCancel)
-	// Auto-close the stream once the pass has ended and it has gone idle, warning
-	// at 60/30/10 seconds first (TC-ST-005). Disabled if the pass end time can't be
-	// resolved (e.g. no credentials / limited mode).
+	// Auto-close the stream once the pass has ended and it has been idle for
+	// --idle-timeout, warning at 60/30/10 seconds first (TC-ST-005). Disabled by
+	// --idle-timeout 0, or if the pass end time can't be resolved (e.g. no
+	// credentials / limited mode).
 	startIdleShutdownMonitor(ctx, cancel, flags, effectivePassID, stats, &idleClosed)
 	waitForCompletion(ctx, cfg, stats, s3c, &wg, errCh, statsCancel, closeStream, &idleClosed)
 	return nil

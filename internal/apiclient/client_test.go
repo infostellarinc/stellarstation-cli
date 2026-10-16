@@ -175,6 +175,51 @@ func TestListVisibilities(t *testing.T) {
 	}
 }
 
+func TestListVisibilities_GroundStationAndMinMaxElevationFilters(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		if got := q.Get("ground_station_ids"); got != "gs-1,gs-2" {
+			t.Errorf("ground_station_ids = %q, want gs-1,gs-2", got)
+		}
+		if got := q.Get("min_max_elevation_degrees"); got != "12.5" {
+			t.Errorf("min_max_elevation_degrees = %q, want 12.5", got)
+		}
+		_ = json.NewEncoder(w).Encode([]Visibility{})
+	}))
+	defer srv.Close()
+
+	minElevation := 12.5
+	c := New(srv.URL, staticToken())
+	if _, err := c.ListVisibilities(context.Background(), ListVisibilitiesOpts{
+		SatelliteIDs:           []string{"sat-1"},
+		GroundStationIDs:       []string{"gs-1", "gs-2"},
+		MinMaxElevationDegrees: &minElevation,
+	}); err != nil {
+		t.Fatalf("ListVisibilities: %v", err)
+	}
+}
+
+func TestListVisibilities_OmitsUnsetFilters(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		for _, key := range []string{"ground_station_ids", "min_max_elevation_degrees"} {
+			if q.Has(key) {
+				t.Errorf("query has %q = %q, want omitted", key, q.Get(key))
+			}
+		}
+		_ = json.NewEncoder(w).Encode([]Visibility{})
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, staticToken())
+	if _, err := c.ListVisibilities(
+		context.Background(),
+		ListVisibilitiesOpts{SatelliteIDs: []string{"sat-1"}},
+	); err != nil {
+		t.Fatalf("ListVisibilities: %v", err)
+	}
+}
+
 func TestListSatellites(t *testing.T) {
 	want := ListSatellitesResponse{Satellites: []Satellite{
 		{ID: "sat-1", DisplayName: "MySat", OrganizationID: "org-1", Schedulable: true},

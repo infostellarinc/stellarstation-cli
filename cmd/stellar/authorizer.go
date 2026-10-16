@@ -193,6 +193,32 @@ type AuthorizerRequest struct {
 	OverrideCommandingLock bool `json:"overrideCommandingLock,omitempty"`
 }
 
+// authorizerErrorStreamLimitReached is the authorizer's error code when the pass
+// already has as many open streams as its execution configuration allows.
+const authorizerErrorStreamLimitReached = "stream_limit_reached"
+
+// authorizerError is a 4xx refusal from the authorizer, carrying its error code
+// so callers can explain specific refusals (see authorizerErrorStreamLimitReached).
+type authorizerError struct {
+	Status  int    `json:"-"`
+	Code    string `json:"error"`
+	Message string `json:"message"`
+}
+
+func (e *authorizerError) Error() string {
+	detail := e.Message
+	if detail == "" {
+		detail = e.Code
+	}
+	return fmt.Sprintf("%s (status %d)", detail, e.Status)
+}
+
+// isAuthorizerError reports whether err is an authorizer refusal with the given code.
+func isAuthorizerError(err error, code string) bool {
+	var ae *authorizerError
+	return errors.As(err, &ae) && ae.Code == code
+}
+
 // fetchAuthorizerCredentials calls the authorizer API to get temporary AWS credentials
 // and stream configuration (S3 paths, MQTT topics) for the requested features.
 // Retries on 5xx errors to ride out transient server errors (e.g., 503 Service Unavailable).
@@ -309,18 +335,11 @@ func fetchAuthorizerCredentials(
 			body, _ := io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
 
-			var errorResp struct {
-				Error   string `json:"error"`
-				Message string `json:"message"`
-			}
-			if err := json.Unmarshal(body, &errorResp); err == nil {
-				detail := errorResp.Message
-				if detail == "" {
-					detail = errorResp.Error
-				}
-				if detail != "" {
-					return nil, fmt.Errorf("%s (status %d)", detail, resp.StatusCode)
-				}
+			var errorResp authorizerError
+			decodeErr := json.Unmarshal(body, &errorResp)
+			if decodeErr == nil && (errorResp.Code != "" || errorResp.Message != "") {
+				errorResp.Status = resp.StatusCode
+				return nil, &errorResp
 			}
 			return nil, fmt.Errorf("the request was rejected (status %d): %s", resp.StatusCode, string(body))
 		}

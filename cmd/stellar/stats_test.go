@@ -1,6 +1,7 @@
 package main
 
 import (
+	"reflect"
 	"testing"
 	"time"
 
@@ -75,6 +76,68 @@ func TestActivityCounter(t *testing.T) {
 	b := stats.ActivityCount()
 	if a != b {
 		t.Errorf("ActivityCount changed with no activity: %d != %d", a, b)
+	}
+}
+
+// TestIdleShutdownScheduleFor verifies how --idle-timeout is split into the
+// idle-shutdown monitor's inactivity delay and close countdown: the warnings keep
+// their fixed distance from the close, the default reproduces the original fixed
+// timings, and a timeout too short for the standard countdown warns once at its
+// halfway point.
+func TestIdleShutdownScheduleFor(t *testing.T) {
+	standard := []idleShutdownWarning{{30 * time.Second, 1}, {10 * time.Second, 2}}
+	cases := []struct {
+		name    string
+		timeout time.Duration
+		want    idleShutdownSchedule
+	}{
+		{"default keeps the original 60 s delay and 60 s countdown", defaultIdleTimeout,
+			idleShutdownSchedule{inactivityDelay: 60 * time.Second, grace: 60 * time.Second, warnings: standard}},
+		{"longer timeout extends only the delay", 5 * time.Minute,
+			idleShutdownSchedule{inactivityDelay: 4 * time.Minute, grace: 60 * time.Second, warnings: standard}},
+		{"exactly the countdown announces as soon as idle", 60 * time.Second,
+			idleShutdownSchedule{inactivityDelay: 0, grace: 60 * time.Second, warnings: standard}},
+		{"shorter than the countdown warns once at half", 20 * time.Second,
+			idleShutdownSchedule{inactivityDelay: 0, grace: 20 * time.Second,
+				warnings: []idleShutdownWarning{{10 * time.Second, 2}}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := idleShutdownScheduleFor(tc.timeout)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("idleShutdownScheduleFor(%s) = %+v, want %+v", tc.timeout, got, tc.want)
+			}
+			if got.inactivityDelay+got.grace != tc.timeout {
+				t.Errorf("delay %s + countdown %s != timeout %s", got.inactivityDelay, got.grace, tc.timeout)
+			}
+		})
+	}
+}
+
+// TestCrossedIdleWarning verifies the countdown prints the most urgent warning
+// whose threshold has been reached, skipping any less urgent one crossed in the
+// same tick, and never repeats one.
+func TestCrossedIdleWarning(t *testing.T) {
+	warnings := []idleShutdownWarning{{30 * time.Second, 1}, {10 * time.Second, 2}}
+	cases := []struct {
+		name      string
+		next      int
+		remaining time.Duration
+		want      int
+	}{
+		{"none crossed yet", 0, 45 * time.Second, -1},
+		{"30 s crossed", 0, 30 * time.Second, 0},
+		{"both crossed at once picks the most urgent", 0, 5 * time.Second, 1},
+		{"30 s already printed", 1, 20 * time.Second, -1},
+		{"10 s after 30 s", 1, 9 * time.Second, 1},
+		{"all printed", 2, 1 * time.Second, -1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := crossedIdleWarning(warnings, tc.next, tc.remaining); got != tc.want {
+				t.Errorf("crossedIdleWarning(next=%d, remaining=%s) = %d, want %d", tc.next, tc.remaining, got, tc.want)
+			}
+		})
 	}
 }
 

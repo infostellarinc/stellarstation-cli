@@ -132,9 +132,13 @@ type Visibility struct {
 
 // ListVisibilitiesOpts are query parameters for ListVisibilities.
 type ListVisibilitiesOpts struct {
-	SatelliteIDs []string
-	Start        *time.Time
-	Stop         *time.Time
+	SatelliteIDs     []string
+	GroundStationIDs []string
+	Start            *time.Time
+	Stop             *time.Time
+	// MinMaxElevationDegrees keeps only visibilities whose max elevation is at
+	// least this many degrees. nil disables the filter.
+	MinMaxElevationDegrees *float64
 }
 
 // ---- Satellites ------------------------------------------------------------

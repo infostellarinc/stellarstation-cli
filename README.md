@@ -336,6 +336,10 @@ through reserving passes and downloading telemetry, are in
 - **"Your API key was not accepted"**: the key is most likely issued for a
   different StellarStation environment than the address in `STELLAR_API_URL`.
   Confirm both with your StellarStation contact.
+- **"Could not set up this pass: this pass already has N open stream(s)"**:
+  the pass's configuration limits how many clients may stream it at once, and
+  that many are already connected. Close one of the other streams and try
+  again.
 - **A pass produced no telemetry**: confirm the window has started and the pass
   is still scheduled, with `stellar satellite get-pass <pass-id>`. If it has
   already completed, stream it again to retrieve whatever was received.
@@ -500,8 +504,16 @@ remote access to the proxy.
 | --- | --- | --- |
 | `--stats` | off | Show live throughput and timing, and a summary per channel at the end |
 | `--enable-auto-close` | off | Exit when the satellite signals end of data, instead of waiting for Ctrl-C |
+| `--idle-timeout <duration>` | `2m` | Once the pass has ended, close the stream after it has been idle this long. `0` keeps it open until Ctrl-C |
 | `--verbose` | off | Show the technical detail of each step |
 | `--debug` | off | Show low-level detail. Very noisy, and intended for support cases |
+
+A stream that is still open after the pass ends closes itself once nothing has
+been sent or received for `--idle-timeout`, so a forgotten session does not run
+on. It warns 60, 30 and 10 seconds before closing, and any activity cancels the
+close and restarts the timer. With a timeout under a minute it announces the
+close as soon as the stream is idle and warns once more at the halfway point.
+Durations are written like `90s`, `2m` or `1h`.
 
 ### Advanced tuning
 
