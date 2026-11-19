@@ -63,6 +63,12 @@ func AckTopic(baseTopic string) string {
 	return baseTopic + "/ack"
 }
 
+// StatusTopic is where a station reports the progress of the commands or
+// configuration requests published on baseTopic.
+func StatusTopic(baseTopic string) string {
+	return baseTopic + "/status"
+}
+
 // TelemetryAckTopicFilter returns the subscribe filter for telemetry acks on a
 // channel, across every framing (the ack topic embeds framing, which the
 // subscriber doesn't know in advance -- one filter per channel rather than one

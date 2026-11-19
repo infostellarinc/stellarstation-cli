@@ -52,6 +52,7 @@ BSD 3-Clause License
   github.com/google/uuid
   github.com/spf13/pflag
   golang.org/x/net
+  golang.org/x/sync/errgroup
   golang.org/x/sync/semaphore
   golang.org/x/sys/unix
   google.golang.org/protobuf
@@ -66,7 +67,22 @@ BSD 2-Clause License
 MIT License
 ------------------------------------------------------------------------------
 
+  charm.land/bubbletea/v2
+  charm.land/lipgloss/v2
+  github.com/benbjohnson/clock
+  github.com/charmbracelet/colorprofile
+  github.com/charmbracelet/ultraviolet
+  github.com/charmbracelet/x/ansi
   github.com/charmbracelet/x/term
+  github.com/charmbracelet/x/termios
+  github.com/charmbracelet/x/windows
+  github.com/clipperhouse/displaywidth
+  github.com/clipperhouse/uax29/v2
+  github.com/lucasb-eyer/go-colorful
+  github.com/mattn/go-runewidth
+  github.com/muesli/cancelreader
+  github.com/rivo/uniseg
+  github.com/xo/terminfo
 
 ------------------------------------------------------------------------------
 

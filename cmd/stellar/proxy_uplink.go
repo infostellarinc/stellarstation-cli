@@ -5,8 +5,6 @@ import (
 	"errors"
 	"sync"
 	"time"
-
-	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
 
 // proxyUplinkSender transmits bytes received on the local proxy socket to the
@@ -15,13 +13,10 @@ import (
 // are serialized under a mutex so the per-topic command index stays strictly
 // increasing even when the proxy delivers from several connections at once.
 type proxyUplinkSender struct {
-	client   mqtt.Client
+	pub      *commandPublisher
 	topic    string
 	streamID string
 	planID   string
-	qos      byte
-	stats    *statsTracker
-	window   passWindow
 
 	mu           sync.Mutex
 	index        uint32
@@ -44,16 +39,7 @@ func newProxyUplinkSender(
 		return nil, errors.New("an activated API key is required to transmit uplink data")
 	}
 
-	// Prefer the uplink-direction channel's topic, exactly as the interactive
-	// command sender does (see resolveCommandTopics).
-	commandable := commandableChannelSet(cfg.AuthorizerCreds)
-	var topic string
-	for _, ul := range cfg.AuthorizerCreds.Streams.Uplink {
-		if commandable(ExtractChannelIDFromTopic(ul.PublishTopic)) {
-			topic = ul.PublishTopic
-			break
-		}
-	}
+	topic := firstCommandable(cfg.AuthorizerCreds, cfg.AuthorizerCreds.Streams.Uplink).PublishTopic
 	if topic == "" {
 		return nil, errNoUplinkChannel
 	}
@@ -62,18 +48,16 @@ func newProxyUplinkSender(
 	if err != nil {
 		return nil, err
 	}
+	subscribeCommandReplies(client, cfg, stats)
 
 	streamID, planID := normalizeIDs(cfg, "", "", passID)
 	window := resolveBookingWindow(ctx, cfg, passID)
 
 	return &proxyUplinkSender{
-		client:   client,
+		pub:      newCommandPublisher(client, cfg.MQTTQoS, stats, window),
 		topic:    topic,
 		streamID: streamID,
 		planID:   planID,
-		qos:      cfg.MQTTQoS,
-		stats:    stats,
-		window:   window,
 		index:    1,
 	}, nil
 }
@@ -89,7 +73,7 @@ func (s *proxyUplinkSender) send(data []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err := s.window.check(time.Now()); err != nil {
+	if err := s.pub.window.check(time.Now()); err != nil {
 		if !s.windowWarned {
 			s.windowWarned = true
 			uiWarnf("Proxy uplink data was not transmitted: %v", err)
@@ -100,20 +84,21 @@ func (s *proxyUplinkSender) send(data []byte) {
 	s.windowWarned = false
 
 	idx := s.index
-	if err := PublishSatCommand(
-		context.Background(), s.client, s.topic, s.streamID, s.planID,
-		idx, [][]byte{data}, s.qos, s.stats,
-	); err != nil {
+	cmd, err := PublishSatCommand(s.pub, s.topic, s.streamID, s.planID, idx, [][]byte{data})
+	if err != nil {
 		uiErrf("Could not transmit %d bytes of proxy uplink data: %v", len(data), err)
-		return
+	} else {
+		vlogf("proxy uplink: transmitted command %d (%d bytes)", idx, len(data))
 	}
-	vlogf("proxy uplink: transmitted command %d (%d bytes)", idx, len(data))
-	s.index++
+	// An unconfirmed publish may still arrive, so its index stays used.
+	if cmd != nil {
+		s.index++
+	}
 }
 
 // close disconnects the sender's MQTT client.
 func (s *proxyUplinkSender) close() {
-	if s.client != nil {
-		s.client.Disconnect(mqttDisconnectQuiesce)
+	if s.pub != nil && s.pub.client != nil {
+		s.pub.client.Disconnect(mqttDisconnectQuiesce)
 	}
 }

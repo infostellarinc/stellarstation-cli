@@ -16,10 +16,10 @@ import requests
 TOKEN_REFRESH_MARGIN_SECONDS = 60
 
 
-def fail(message):
+def fail(message, exit_code=1):
     """Prints a message to stderr and exits."""
     print(message, file=sys.stderr)
-    sys.exit(1)
+    sys.exit(exit_code)
 
 
 def _load_api_key(path):

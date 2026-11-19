@@ -44,6 +44,8 @@ type flagSet struct {
 	sendSatCommand         string
 	sendSatCommands        string
 	sendGsConfig           string
+	waitFor                string
+	waitTimeout            time.Duration
 	interactive            bool
 	disableDownlink        bool
 	disableMonitoring      bool
@@ -59,6 +61,7 @@ type flagSet struct {
 	enableVerbose          bool
 	enableDebug            bool
 	enableAutoClose        bool
+	idleTimeout            time.Duration
 	overrideCommandingLock bool
 	acceptedFraming        string
 
@@ -109,6 +112,17 @@ Type commands as the pass runs (interactive):
 
 Send one satellite command and exit:
   stellar satellite open-stream --pass-id <pass-id> --send-sat-command 0A1B2C3D
+
+Send one command and wait until the ground station reports it radiated:
+  stellar satellite open-stream --pass-id <pass-id> --send-sat-command 0A1B2C3D --wait-for final
+
+Nothing resends an unanswered command: a copy sent during a pass only adds to
+the congestion that delayed the first, and the ground station may already have
+transmitted it. One-shot sends exit with:
+  0  accepted (received), or delivered (final)
+  1  refused, failed, partially or not applied, not transmitted, or any other error
+  3  outcome unknown: check spacecraft telemetry before sending it again
+  4  the stream was revoked and disconnected; open a new stream
 
 Tip: add --verbose for the technical detail, or --stats for live throughput.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -161,6 +175,19 @@ func registerOpenStreamFlags(cmd *cobra.Command, flags *flagSet) {
 		"Send several satellite commands in order (comma-separated hex, up to 100 KiB each), then exit",
 	)
 	f.StringVar(&flags.sendGsConfig, "send-gs-config", "", "Send one ground-station config request (JSON), then exit")
+	f.StringVar(
+		&flags.waitFor,
+		"wait-for",
+		string(waitForReceived),
+		"What a one-shot send waits for before it exits: 'received' (the ground station acknowledgement) "+
+			"or 'final' (the final delivery status, such as radiated)",
+	)
+	f.DurationVar(
+		&flags.waitTimeout,
+		"wait-timeout",
+		defaultCommandWaitTimeout,
+		"How long a one-shot send waits for --wait-for before it reports the outcome as unknown",
+	)
 	f.BoolVar(&flags.interactive, "interactive", false, "Type commands to send while the pass runs")
 
 	// Feature flags
@@ -201,6 +228,13 @@ func registerOpenStreamFlags(cmd *cobra.Command, flags *flagSet) {
 		"enable-auto-close",
 		false,
 		"Stop automatically when the satellite signals end-of-data",
+	)
+	f.DurationVar(
+		&flags.idleTimeout,
+		"idle-timeout",
+		defaultIdleTimeout,
+		"Close the stream once it has been idle this long after the pass ends, "+
+			"warning before it closes (0 keeps it open until Ctrl-C)",
 	)
 	f.BoolVar(
 		&flags.overrideCommandingLock,
@@ -356,6 +390,20 @@ func validateBasicFlags(flags *flagSet) {
 	}
 	if flags.mqttQoS < 0 || flags.mqttQoS > 2 {
 		streamUsageFatal(fmt.Sprintf("--mqtt-qos must be 0, 1, or 2 (you gave %d).", flags.mqttQoS))
+	}
+	if flags.waitFor == "" {
+		flags.waitFor = string(waitForReceived)
+	}
+	if _, err := parseWaitMode(flags.waitFor); err != nil {
+		streamUsageFatal(err.Error() + ".")
+	}
+	if flags.waitTimeout <= 0 {
+		streamUsageFatal(fmt.Sprintf("--wait-timeout must be positive (you gave %s).", flags.waitTimeout))
+	}
+	if flags.idleTimeout < 0 {
+		streamUsageFatal(
+			fmt.Sprintf("--idle-timeout must be 0 or a positive duration (you gave %s).", flags.idleTimeout),
+		)
 	}
 }
 
@@ -543,6 +591,11 @@ func buildConfigWithCreds(
 	if len(outputFileMode) == 0 {
 		outputFileMode = []string{"all-combined"}
 	}
+	// Validated with the other flags; an unset value means the default.
+	waitFor, err := parseWaitMode(flags.waitFor)
+	if err != nil {
+		waitFor = waitForReceived
+	}
 
 	return Config{
 		SourceType:           srcType,
@@ -573,6 +626,8 @@ func buildConfigWithCreds(
 		EnableDebug:          flags.enableDebug,
 		EnableAutoClose:      flags.enableAutoClose,
 		AcceptedFraming:      acceptedFraming,
+		WaitFor:              waitFor,
+		WaitTimeout:          flags.waitTimeout,
 	}
 }
 
@@ -618,20 +673,25 @@ func handleOneShotCommands(
 		)
 	}
 	stats := newStatsTracker(cfg.EnableDiagnostics)
-	if err := runCommandSender(
+	err := runCommandSender(
 		ctx, cfg,
 		flags.sendSatCommand, flags.sendSatCommands, flags.sendGsConfig,
 		false, "",
 		effectivePassID, effectivePassID,
 		nil, stats,
-	); err != nil {
-		uiErrf("Could not send the command: %v", err)
-		closeStream()
-		os.Exit(1)
-	}
+	)
 	if cfg.EnableDiagnostics {
 		writeDiagnosticsFile(context.Background(), cfg, stats, nil)
 	}
+	if err == nil {
+		return
+	}
+	code, shown := exitCodeFor(err)
+	if !shown {
+		uiErrf("Could not send the command: %v", err)
+	}
+	closeStream()
+	os.Exit(code)
 }
 
 func startStatsLogger(ctx context.Context, stats *statsTracker) func() {
@@ -834,15 +894,61 @@ func resolvePassEndTime(ctx context.Context, flags *flagSet, passID string) time
 	return end
 }
 
+// idleShutdownSchedule is the timing the idle-shutdown monitor runs on. It is
+// derived from --idle-timeout by idleShutdownScheduleFor.
+type idleShutdownSchedule struct {
+	// inactivityDelay is how long the stream must stay quiet past pass end before
+	// the close countdown is announced.
+	inactivityDelay time.Duration
+	// grace is the countdown from the announcement to the close.
+	grace time.Duration
+	// warnings are the further warnings printed during the countdown, most
+	// distant from the close first.
+	warnings []idleShutdownWarning
+}
+
+// idleShutdownWarning is one "closing in N seconds" warning, printed when that
+// much time remains before the close.
+type idleShutdownWarning struct {
+	remaining time.Duration
+	severity  int // see uiCountdownf
+}
+
+// idleShutdownScheduleFor derives the monitor's timings from --idle-timeout, the
+// total idle time past pass end after which the stream closes. The warnings keep
+// their fixed distance from the close: the countdown is announced 60 seconds
+// before it, with further warnings at 30 and 10, and the inactivity delay absorbs
+// the rest, so the default timeout reproduces the original 60 s delay + 60 s
+// countdown. A timeout shorter than the countdown cannot fit those, so the
+// countdown is announced as soon as the stream is idle and runs for the whole
+// timeout, with a single warning at its halfway point.
+func idleShutdownScheduleFor(timeout time.Duration) idleShutdownSchedule {
+	if timeout >= idleShutdownGrace {
+		return idleShutdownSchedule{
+			inactivityDelay: timeout - idleShutdownGrace,
+			grace:           idleShutdownGrace,
+			warnings: []idleShutdownWarning{
+				{remaining: idleShutdownWarn30, severity: 1},
+				{remaining: idleShutdownWarn10, severity: 2},
+			},
+		}
+	}
+	return idleShutdownSchedule{
+		grace:    timeout,
+		warnings: []idleShutdownWarning{{remaining: timeout / 2, severity: 2}},
+	}
+}
+
 // startIdleShutdownMonitor watches a live stream and gracefully closes it once
 // BOTH conditions hold: the pass has ended (now is past the latest of its
 // scheduled/visibility/booking stop) AND no message of any kind has been sent or
 // received since the previous sample (the stream has gone quiet). After the pass
-// ends it waits idleShutdownInactivityDelay of continuous inactivity before
-// announcing the close, then counts down with escalating, colored warnings at
-// 60/30/10 seconds and cancels the run context, which drives the normal
+// ends it waits out the schedule's inactivity delay of continuous inactivity
+// before announcing the close, then counts down with escalating, colored
+// warnings (at 60/30/10 seconds before the close by default; see
+// idleShutdownScheduleFor) and cancels the run context, which drives the normal
 // graceful-shutdown path. Any activity resets it: it waits out the inactivity
-// delay again the next time the stream falls idle.
+// delay again the next time the stream falls idle. --idle-timeout 0 disables it.
 //
 // The pass end time is resolved inside the goroutine so stream startup is never
 // blocked on the pass fetch; when it cannot be resolved the monitor simply
@@ -851,13 +957,18 @@ func startIdleShutdownMonitor(
 	ctx context.Context, cancel context.CancelFunc, flags *flagSet,
 	passID string, stats *statsTracker, idleClosed *atomic.Bool,
 ) {
+	if flags.idleTimeout <= 0 {
+		vlogf("idle-shutdown: disabled (--idle-timeout 0); the stream stays open until Ctrl-C")
+		return
+	}
+	schedule := idleShutdownScheduleFor(flags.idleTimeout)
 	go func() {
 		endTime := resolvePassEndTime(ctx, flags, passID)
 		if endTime.IsZero() {
 			return
 		}
-		vlogf("idle-shutdown: armed; auto-close when idle after pass end %s",
-			endTime.UTC().Format(time.RFC3339))
+		vlogf("idle-shutdown: armed; auto-close when idle for %s after pass end %s",
+			flags.idleTimeout, endTime.UTC().Format(time.RFC3339))
 
 		ticker := time.NewTicker(idleShutdownPoll)
 		defer ticker.Stop()
@@ -865,7 +976,7 @@ func startIdleShutdownMonitor(
 		lastCount := stats.ActivityCount()
 		var idleSince time.Time // zero == active/not yet idle after pass end
 		var deadline time.Time  // zero == countdown not armed
-		warned30, warned10 := false, false
+		nextWarning := 0        // index into schedule.warnings of the next one to print
 
 		for {
 			select {
@@ -886,48 +997,62 @@ func startIdleShutdownMonitor(
 				}
 				idleSince = time.Time{}
 				deadline = time.Time{}
-				warned30, warned10 = false, false
+				nextWarning = 0
 				continue
 			}
 
-			// Past the pass end and quiet. Require idleShutdownInactivityDelay of
+			// Past the pass end and quiet. Require the inactivity delay of
 			// continuous inactivity before announcing/arming the close countdown, so
 			// the operator is not warned the instant the pass ends.
 			if idleSince.IsZero() {
 				idleSince = now
 				continue
 			}
-			if now.Sub(idleSince) < idleShutdownInactivityDelay {
+			if now.Sub(idleSince) < schedule.inactivityDelay {
 				continue
 			}
 
 			// Inactivity threshold reached: arm the countdown on the first qualifying tick.
 			if deadline.IsZero() {
-				deadline = now.Add(idleShutdownGrace)
-				warned30, warned10 = false, false
+				deadline = now.Add(schedule.grace)
+				nextWarning = 0
 				uiCountdownf(
 					0,
 					"Pass has ended and the stream is idle - closing in %d seconds unless activity resumes.",
-					int(idleShutdownGrace.Seconds()),
+					int(schedule.grace.Seconds()),
 				)
 				continue
 			}
 
-			switch remaining := time.Until(deadline); {
-			case remaining <= 0:
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
 				idleClosed.Store(true)
 				uiCountdownf(2, "No activity since the pass ended - closing the stream now.")
 				cancel()
 				return
-			case remaining <= idleShutdownWarn10 && !warned10:
-				warned10 = true
-				uiCountdownf(2, "Closing the stream in 10 seconds (no activity since the pass ended).")
-			case remaining <= idleShutdownWarn30 && !warned30:
-				warned30 = true
-				uiCountdownf(1, "Closing the stream in 30 seconds (no activity since the pass ended).")
+			}
+			// Print the most urgent warning whose threshold has been crossed, and
+			// skip any less urgent ones crossed in the same tick.
+			if i := crossedIdleWarning(schedule.warnings, nextWarning, remaining); i >= 0 {
+				nextWarning = i + 1
+				w := schedule.warnings[i]
+				uiCountdownf(w.severity, "Closing the stream in %d seconds (no activity since the pass ended).",
+					int(w.remaining.Seconds()))
 			}
 		}
 	}()
+}
+
+// crossedIdleWarning returns the index of the most urgent warning at or after
+// next whose threshold remaining has reached, or -1 when none has.
+func crossedIdleWarning(warnings []idleShutdownWarning, next int, remaining time.Duration) int {
+	crossed := -1
+	for i := next; i < len(warnings); i++ {
+		if remaining <= warnings[i].remaining {
+			crossed = i
+		}
+	}
+	return crossed
 }
 
 func waitForCompletion(
@@ -1057,8 +1182,15 @@ func printStreamSummary(cfg Config, stats *statsTracker) {
 	if cfg.EnableUplink || cfg.EnableConfigRequests {
 		sat, gs := stats.SentCommandCounts()
 		uiDataf(kindUplink, "%d satellite commands sent, %d ground-station config requests sent", sat, gs)
+		if delivery := countDeliveries(stats.commandSnapshots()).String(); delivery != "" {
+			uiDataf(kindUplink, "%s", delivery)
+		}
 	}
-	uiDataf(kindAck, "%d sent, %d received", stats.acksSent, stats.acksReceived)
+	ackLine := fmt.Sprintf("%d sent, %d received", stats.acksSent, stats.acksReceived)
+	if stats.nacksReceived > 0 {
+		ackLine += fmt.Sprintf(", %d rejected", stats.nacksReceived)
+	}
+	uiDataf(kindAck, "%s", ackLine)
 	uiDimf("  Files saved under %s", cfg.DestDir)
 }
 
@@ -1149,11 +1281,12 @@ func validateS3Access(
 func fetchAndApplyAuthorizerCredentials(
 	ctx context.Context, flags *flagSet,
 	effectivePassID, effectiveEnv string, channelIDs []string,
-) (authCreds *AuthorizerCredentials, credStore *credentialStore, env, prefix string) {
+	onRevoked func(detail string),
+) (authCreds *AuthorizerCredentials, credStore *credentialStore, watch *streamRevocationWatch, env, prefix string) {
 	env = effectiveEnv
 	if flags.tokenSource == nil {
 		prefix = buildPrefix(flags, env, flags.passID)
-		return nil, nil, env, prefix
+		return nil, nil, nil, env, prefix
 	}
 
 	authorizeURL := strings.TrimRight(flags.apiURL, "/") + "/authorize"
@@ -1181,7 +1314,19 @@ func fetchAndApplyAuthorizerCredentials(
 	if err != nil {
 		stopSpinner()
 		uiErrf("Could not set up this pass: %v", err)
-		uiInfof("Check the pass ID is correct and that your API key has access to it.")
+		switch {
+		case isAuthorizerError(err, authorizerErrorStreamLimitReached):
+			uiInfof("This pass is already open in as many clients as its configuration allows. " +
+				"Close one of the other streams, then try again.")
+		case isAuthorizerError(err, authorizerErrorReplayWindowClosed):
+			uiInfof("A pass can only be replayed while its data is kept. " +
+				"Contact StellarStation support if you need pass data kept for longer.")
+		case isAuthorizerError(err, authorizerErrorConnectionWindowNotOpen):
+			// The message already says when the pass opens; no hint, and in
+			// particular not the default one about the pass ID or API key.
+		default:
+			uiInfof("Check the pass ID is correct and that your API key has access to it.")
+		}
 		os.Exit(1)
 	}
 	stopSpinner()
@@ -1207,7 +1352,8 @@ func fetchAndApplyAuthorizerCredentials(
 	}
 
 	credStore = newCredentialStore(authCreds)
-	go runCredentialRefresher(ctx, credStore, authorizeURL, flags.tokenSource, authReq)
+	watch = newStreamRevocationWatch(authorizeURL, flags.tokenSource, authReq, credStore, onRevoked)
+	go runCredentialRefresher(ctx, watch)
 
 	if authCreds.S3Bucket == "" {
 		log.Fatal("Bucket not provided by authorizer.")
@@ -1222,7 +1368,7 @@ func fetchAndApplyAuthorizerCredentials(
 	} else {
 		prefix = buildPrefix(flags, env, flags.passID)
 	}
-	return authCreds, credStore, env, prefix
+	return authCreds, credStore, watch, env, prefix
 }
 
 // runOpenStream is the main entry point for the open-stream command. It
@@ -1233,8 +1379,13 @@ func fetchAndApplyAuthorizerCredentials(
 // config). When the response carries no per-channel rate classes, it falls back
 // to deriving the classification from the granted MQTT topics.
 func configureChannelRates(cfg *Config, authCreds *AuthorizerCredentials) {
-	if hr := authCreds.HighRateChannelIDs(); len(hr) > 0 {
-		cfg.HighRateChannelIDs = hr
+	if authCreds != nil && len(authCreds.Channels) > 0 {
+		// The authorizer described every selected channel. A non-nil empty list
+		// means "no high-rate channel", so no S3 high-rate reader starts.
+		cfg.HighRateChannelIDs = authCreds.HighRateChannelIDs()
+		if cfg.HighRateChannelIDs == nil {
+			cfg.HighRateChannelIDs = []string{}
+		}
 		logChannelClassification(authCreds.Channels)
 	} else if authCreds != nil && len(authCreds.Streams.LowRate) > 0 {
 		lowRateSet := make(map[string]bool)
@@ -1445,8 +1596,14 @@ func runOpenStream(cmd *cobra.Command, flags *flagSet) error {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 
-	authCreds, credStore, effectiveEnv, prefix := fetchAndApplyAuthorizerCredentials(
+	// A revoked stream cannot continue: say so, then stop the session like
+	// Ctrl-C would. runOpenStream exits with exitStreamRevoked once it has.
+	authCreds, credStore, watch, effectiveEnv, prefix := fetchAndApplyAuthorizerCredentials(
 		ctx, flags, effectivePassID, effectiveEnv, channelIDs,
+		func(detail string) {
+			reportStreamRevoked(detail)
+			cancel()
+		},
 	)
 	// fetchAndApplyAuthorizerCredentials may resolve flags.passID from --satellite-id.
 	effectivePassID = flags.passID
@@ -1463,6 +1620,9 @@ func runOpenStream(cmd *cobra.Command, flags *flagSet) error {
 			if !useAuthorizer || authCreds == nil {
 				return
 			}
+			// Closing revokes the stream's certificate, which drops its MQTT
+			// connections; that is not an outage to report.
+			streamClosing.Store(true)
 			closeAuthorizerSession(flags.apiURL, flags.tokenSource, effectivePassID, authCreds.StreamID)
 		})
 	}
@@ -1534,6 +1694,7 @@ func runOpenStream(cmd *cobra.Command, flags *flagSet) error {
 	// and graceful shutdown. Note that os.Exit / log.Fatal skip defers, so those
 	// hard-exit paths must call closeStream() explicitly before exiting;
 	// otherwise the commanding lock leaks until an explicit close or override.
+	cfg.ConnectionLost = watch.connectionLost
 	handleOneShotCommands(ctx, flags, cfg, effectivePassID, closeStream)
 	if flags.sendSatCommand != "" || flags.sendSatCommands != "" || flags.sendGsConfig != "" {
 		cancel()
@@ -1588,12 +1749,31 @@ func runOpenStream(cmd *cobra.Command, flags *flagSet) error {
 	startHighRateReader(ctx, cfg, s3c, stats, &wg, errCh)
 	startMQTTReader(ctx, cfg, s3c, stats, &wg, errCh)
 	startInteractiveCommandSender(ctx, flags, cfg, effectivePassID, stats, &wg, errCh, statsCancel)
-	// Auto-close the stream once the pass has ended and it has gone idle, warning
-	// at 60/30/10 seconds first (TC-ST-005). Disabled if the pass end time can't be
-	// resolved (e.g. no credentials / limited mode).
+	// Auto-close the stream once the pass has ended and it has been idle for
+	// --idle-timeout, warning at 60/30/10 seconds first (TC-ST-005). Disabled by
+	// --idle-timeout 0, or if the pass end time can't be resolved (e.g. no
+	// credentials / limited mode).
 	startIdleShutdownMonitor(ctx, cancel, flags, effectivePassID, stats, &idleClosed)
 	waitForCompletion(ctx, cfg, stats, s3c, &wg, errCh, statsCancel, closeStream, &idleClosed)
+	if watch.isRevoked() {
+		closeStream()
+		os.Exit(exitStreamRevoked) //nolint:gocritic // closeStream is sync.Once-guarded and already called above
+	}
 	return nil
+}
+
+// hasTelemetryChannel reports whether any selected channel delivers telemetry:
+// a downlink, when the authorizer described the channels; otherwise assume so.
+func hasTelemetryChannel(cfg Config) bool {
+	if cfg.AuthorizerCreds == nil || len(cfg.AuthorizerCreds.Channels) == 0 {
+		return true
+	}
+	for _, ch := range cfg.AuthorizerCreds.Channels {
+		if ch.Direction != directionUplink {
+			return true
+		}
+	}
+	return false
 }
 
 // announceStreamReady prints a friendly summary of what the stream is about to
@@ -1603,7 +1783,7 @@ func announceStreamReady(cfg Config, flags *flagSet, passID string) {
 	uiStreamBanner(passID)
 
 	var receiving []string
-	if cfg.EnableDownlink {
+	if cfg.EnableDownlink && hasTelemetryChannel(cfg) {
 		receiving = append(receiving, kindTelemetry.tag())
 	}
 	if cfg.EnableMonitoring {

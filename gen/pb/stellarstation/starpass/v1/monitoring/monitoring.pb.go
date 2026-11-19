@@ -21,14 +21,14 @@
 package monitoring
 
 import (
-	antenna "github.com/infostellarinc/stellarstation-cli/gen/pb/stellarstation/starpass/v1/antenna"
-	common "github.com/infostellarinc/stellarstation-cli/gen/pb/stellarstation/starpass/v1/common"
-	orbit "github.com/infostellarinc/stellarstation-cli/gen/pb/stellarstation/starpass/v1/orbit"
-	radio "github.com/infostellarinc/stellarstation-cli/gen/pb/stellarstation/starpass/v1/radio"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	wrapperspb "google.golang.org/protobuf/types/known/wrapperspb"
 	reflect "reflect"
+	antenna "github.com/infostellarinc/stellarstation-cli/gen/pb/stellarstation/starpass/v1/antenna"
+	common "github.com/infostellarinc/stellarstation-cli/gen/pb/stellarstation/starpass/v1/common"
+	orbit "github.com/infostellarinc/stellarstation-cli/gen/pb/stellarstation/starpass/v1/orbit"
+	radio "github.com/infostellarinc/stellarstation-cli/gen/pb/stellarstation/starpass/v1/radio"
 	sync "sync"
 	unsafe "unsafe"
 )

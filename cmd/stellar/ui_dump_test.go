@@ -76,8 +76,8 @@ func TestPanelVisualDump(t *testing.T) {
 	}
 
 	// A couple of commands are sent (one satellite command, one gs config request).
-	s.AddSentCommand("env/pass/p/channel/c/uplink", "uplink", 1)
-	s.AddSentCommand("env/pass/p/channel/c/config_request", "config_request", 1)
+	s.AddSentCommand("env/pass/p/channel/c/uplink", "uplink", testCommandMsg(1))
+	s.AddSentCommand("env/pass/p/channel/c/config_request", "config_request", testCommandMsg(1))
 
 	// Second frame: more data; panel numbers update in place.
 	for i := 21; i <= 40; i++ {

@@ -59,19 +59,6 @@ func ackedMessageKey(payload []byte) string {
 		ack.GetMessageType(), ack.GetChannelId(), ack.GetFramingType(), ack.GetIndex())
 }
 
-// decodeAckStatusIndex extracts whether an acknowledgement payload is a
-// rejection and the command index it echoes. Only the proto Ack encoding is
-// accepted.
-func decodeAckStatusIndex(payload []byte) (rejected bool, index int64, err error) {
-	var ack streaming.Ack
-	if err := proto.Unmarshal(payload, &ack); err != nil {
-		return false, 0, err
-	}
-	// A proto NACK for an undecodable payload leaves index unset (0), which
-	// matches no command.
-	return ack.GetStatus() == streaming.Ack_NACK, int64(ack.GetIndex()), nil
-}
-
 // buildTelemetryAck creates a proto ack for telemetry messages
 func buildTelemetryAck(
 	cfg Config,

@@ -19,6 +19,10 @@ const (
 
 // Config for the client program.
 type Config struct {
+	// ConnectionLost is told of every lost MQTT connection and reports
+	// whether the loss is explained by the stream's revocation (see
+	// streamRevocationWatch), in which case nothing more is logged about it.
+	ConnectionLost func() bool
 	SourceType     SourceType
 	Bucket         string
 	Prefix         string
@@ -80,6 +84,10 @@ type Config struct {
 
 	// Stream management
 	EnableAutoClose bool // Automatically close stream after receiving stream end message
+
+	// One-shot command sends: what to wait for, and for how long.
+	WaitFor     waitMode
+	WaitTimeout time.Duration
 
 	// Framing filtering
 	AcceptedFraming []string // List of accepted framing types to receive (empty = all)
@@ -144,4 +152,12 @@ type fetchResult struct {
 	// echoed as acked_message_id in the ack. Empty when the message carries no
 	// ID, or was stored as raw bytes (high-rate S3 objects).
 	MessageID string
+
+	// SendTimestamp is the station-side send time for this telemetry chunk
+	// (Telemetry.TimeFirstByteReceived), zero when the sender did not set it.
+	// It is used only to write an optional sidecar file alongside the chunk
+	// (see writeChunkToFile) for one-way latency measurement, and never
+	// affects the chunk file's own content or mtime. Deliberately separate
+	// from the ack's received_at, which is this side's receipt time.
+	SendTimestamp time.Time
 }

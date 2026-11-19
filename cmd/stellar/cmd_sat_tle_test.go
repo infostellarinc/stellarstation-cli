@@ -54,9 +54,35 @@ func TestParseOrbitalDataInput(t *testing.T) {
 		}
 	})
 
-	t.Run("OMM as two-line text is an error", func(t *testing.T) {
-		if _, err := parseOrbitalDataInput(tleLine1+"\n"+tleLine2, "OMM"); err == nil {
-			t.Error("expected error: OMM must be JSON, not two-line text")
+	t.Run("an OMM document is sent whole", func(t *testing.T) {
+		for _, doc := range []string{
+			"CCSDS_OMM_VERS = 2.0\nEPOCH = 2026-11-12T21:13:07.742496\n",
+			`<ndm><omm id="CCSDS_OMM_VERS"></omm></ndm>`,
+			`[{"MEAN_MOTION":15.5}]`,
+		} {
+			got, err := parseOrbitalDataInput(doc, "OMM")
+			if err != nil || len(got) != 1 || got["omm"] != doc {
+				t.Errorf("parseOrbitalDataInput(%q) = %+v, %v; want {omm: <doc>}", doc, got, err)
+			}
+		}
+	})
+
+	t.Run("an OEM is sent whole", func(t *testing.T) {
+		doc := "CCSDS_OEM_VERS = 2.0\n"
+		got, err := parseOrbitalDataInput(doc, "OEM")
+		if err != nil || len(got) != 1 || got["oem"] != doc {
+			t.Errorf("got %+v, %v; want {oem: <doc>}", got, err)
+		}
+	})
+
+	t.Run("Keplerian elements are JSON", func(t *testing.T) {
+		got, err := parseOrbitalDataInput(`{"semi_major_axis_km": 6878.137, "frame": "EME2000"}`, "KEPLERIAN")
+		if err != nil || got["semi_major_axis_km"] != 6878.137 || got["frame"] != "EME2000" {
+			t.Errorf("got %+v, %v", got, err)
+		}
+		if _, err := parseOrbitalDataInput("a = 6878", "KEPLERIAN"); err == nil ||
+			!strings.Contains(err.Error(), "must be JSON") {
+			t.Errorf("non-JSON Keplerian elements: err = %v", err)
 		}
 	})
 

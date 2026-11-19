@@ -21,7 +21,7 @@ func TestCreateOrbitData(t *testing.T) {
 	}))
 	defer srv.Close()
 	c := New(srv.URL, staticToken())
-	got, err := c.CreateOrbitData(context.Background(), "sat-1", OrbitDataCreateRequest{OrbitalDataType: "TLE"})
+	got, err := c.CreateOrbitData(context.Background(), "sat-1", CreateOrbitDataRequest{OrbitalDataType: "TLE"})
 	require.NoError(t, err)
 	require.Equal(t, want.SatelliteID, got.SatelliteID)
 }
@@ -174,7 +174,7 @@ func TestCreatePass_Error(t *testing.T) {
 	srv := errorServer(t)
 	defer srv.Close()
 	c := New(srv.URL, nil)
-	_, err := c.CreatePass(context.Background(), PassCreateRequest{})
+	_, err := c.CreatePass(context.Background(), CreatePassRequest{})
 	require.Error(t, err)
 }
 
@@ -198,7 +198,7 @@ func TestCreateOrbitData_Error(t *testing.T) {
 	srv := errorServer(t)
 	defer srv.Close()
 	c := New(srv.URL, nil)
-	_, err := c.CreateOrbitData(context.Background(), "sat-1", OrbitDataCreateRequest{})
+	_, err := c.CreateOrbitData(context.Background(), "sat-1", CreateOrbitDataRequest{})
 	require.Error(t, err)
 }
 
@@ -214,7 +214,7 @@ func TestUpdateOrbitParameters_Error(t *testing.T) {
 	srv := errorServer(t)
 	defer srv.Close()
 	c := New(srv.URL, nil)
-	_, err := c.UpdateOrbitParameters(context.Background(), "sat-1", OrbitParametersUpdateRequest{})
+	_, err := c.UpdateOrbitParameters(context.Background(), "sat-1", UpdateOrbitParametersRequest{})
 	require.Error(t, err)
 }
 

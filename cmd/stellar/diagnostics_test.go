@@ -1,10 +1,18 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/types/known/timestamppb"
+
+	streaming "github.com/infostellarinc/stellarstation-cli/gen/pb/stellarstation/satellitestreamer"
+	"github.com/infostellarinc/stellarstation-cli/internal/commandseq"
 )
 
 func TestFormatUTCTimestamp(t *testing.T) {
@@ -159,21 +167,57 @@ func TestGetErrors(t *testing.T) {
 }
 
 func TestBuildCommandStats(t *testing.T) {
-	stats := newStatsTracker(false)
-	stats.AddSentCommand("pass-123/uplink", "uplink", 1)
-	stats.AddSentCommand("pass-123/uplink", "uplink", 2)
-	stats.AddSentCommand("pass-123/config_request", "config_request", 1)
+	stats, cmds := newStatusTracker(3)
+	gs := stats.AddSentCommand("pass-123/config_request", cmdTypeConfigRequest, testCommandMsg(1))
+	stats.AddAckReceived(testUplinkTopic+"/ack", testAck(t, cmds[0], streaming.Ack_ACK, ""))
+	stats.AddStatusBatch(testUplinkTopic+"/status", statusBatch(t, &streaming.CommandStatus{
+		AckedMessageId: cmds[0].messageID, Index: 1,
+		Stage:        streaming.CommandStage_COMMAND_STAGE_RADIATED,
+		Outcome:      streaming.CommandOutcome_COMMAND_OUTCOME_SUCCEEDED,
+		MessageFinal: true,
+		RadiatedAt:   timestamppb.New(testRadiatedAt),
+		ProviderCode: "cortex-tcu:0",
+	}))
+	stats.AddAckReceived(testUplinkTopic+"/ack", testAck(t, cmds[1], streaming.Ack_NACK, commandseq.ReasonArrivedLate))
 
-	// Mark one as acked
-	stats.AddAckReceived("pass-123/uplink/ack", []byte(`{"pass_id":"pass-123","message_type":"uplink","index":1}`))
+	got := buildCommandStats(stats)
 
-	commandStats := buildCommandStats(stats)
-	if commandStats.UplinkStats.TotalSent != 2 {
-		t.Errorf("Sat commands total sent = %v, want 2", commandStats.UplinkStats.TotalSent)
-	}
-	if commandStats.ConfigRequestStats.TotalSent != 1 {
-		t.Errorf("GS configs total sent = %v, want 1", commandStats.ConfigRequestStats.TotalSent)
-	}
+	up := got.UplinkStats
+	assert.Equal(t, 3, up.TotalSent)
+	assert.Equal(t, 1, up.Acked)
+	assert.Equal(t, 1, up.Rejected)
+	assert.Equal(t, 1, up.Unacked)
+	assert.Equal(t, 1, up.Radiated)
+	assert.Equal(t, 1, up.Late)
+	require.Len(t, up.Commands, 3)
+	first := up.Commands[0]
+	first.Timestamp = ""
+	assert.Equal(t, CommandDetail{
+		Index: 1, MessageID: cmds[0].messageID, Acked: true,
+		Stage: "radiated", Outcome: "succeeded", RadiatedAt: "2026-10-01T12:30:05.000Z", ProviderCode: "cortex-tcu:0",
+	}, first)
+	assert.Equal(t, commandseq.ReasonArrivedLate, up.Commands[1].NackReasonCode)
+
+	assert.Equal(t, 1, got.ConfigRequestStats.TotalSent)
+	assert.Equal(t, gs.index, got.ConfigRequestStats.Commands[0].Index)
+}
+
+// The per-command fields keep the report's snake_case names and are omitted
+// when the station reported nothing.
+func TestCommandDetailJSON(t *testing.T) {
+	full, err := json.Marshal(CommandDetail{
+		Index: 1, MessageID: "m", Timestamp: "t", NackReasonCode: "arrived_late",
+		Stage: "radiated", Outcome: "failed", Skipped: true, RadiatedAt: "r", Failure: "deadline_exceeded",
+		ProviderCode: "cortex-tcu:12", Reason: "late",
+	})
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"index":1,"message_id":"m","timestamp":"t","acked":false,"rejected":false,
+		"nack_reason_code":"arrived_late","stage":"radiated","outcome":"failed","skipped":true,
+		"radiated_at":"r","failure":"deadline_exceeded","provider_code":"cortex-tcu:12","reason":"late"}`, string(full))
+
+	empty, err := json.Marshal(CommandDetail{Index: 1, Timestamp: "t"})
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"index":1,"timestamp":"t","acked":false,"rejected":false}`, string(empty))
 }
 
 func TestBuildDiagnosticsData(t *testing.T) {
@@ -183,7 +227,7 @@ func TestBuildDiagnosticsData(t *testing.T) {
 	stats.AddMonitoringMessage(SourceMQTT)
 	stats.AddConfigMessage(SourceS3)
 	stats.AddEventMessage(SourceMQTT)
-	stats.AddSentCommand("pass-123/uplink", "uplink", 1)
+	stats.AddSentCommand("pass-123/uplink", "uplink", testCommandMsg(1))
 
 	cfg := Config{
 		PassID:            "pass-123",

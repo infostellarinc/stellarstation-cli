@@ -138,6 +138,82 @@ func TestFetchAuthorizerCredentials_ErrorResponses(t *testing.T) {
 		}
 	})
 
+	t.Run("409 stream limit carries its code", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).
+				Encode(map[string]string{"error": "stream_limit_reached", "message": "this pass already has 1 open stream(s)"})
+		}))
+		defer server.Close()
+		_, err := fetchAuthorizerCredentials(
+			t.Context(),
+			server.URL,
+			testTokenSource(),
+			AuthorizerRequest{PassID: "pass-123"},
+		)
+		if !isAuthorizerError(err, authorizerErrorStreamLimitReached) {
+			t.Fatalf("expected a stream_limit_reached authorizer error, got %v", err)
+		}
+		if isAuthorizerError(err, "commanding_conflict") {
+			t.Fatalf("error code must be matched exactly, got %v", err)
+		}
+		if want := "this pass already has 1 open stream(s) (status 409)"; err.Error() != want {
+			t.Fatalf("error = %q, want %q", err.Error(), want)
+		}
+	})
+
+	t.Run("410 replay window closed carries its code", func(t *testing.T) {
+		const message = "This pass can no longer be replayed as it has exceeded the 90-day expiration."
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusGone)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "replay_window_closed", "message": message})
+		}))
+		defer server.Close()
+		_, err := fetchAuthorizerCredentials(
+			t.Context(),
+			server.URL,
+			testTokenSource(),
+			AuthorizerRequest{PassID: "pass-123"},
+		)
+		if !isAuthorizerError(err, authorizerErrorReplayWindowClosed) {
+			t.Fatalf("expected a replay_window_closed authorizer error, got %v", err)
+		}
+		if want := message + " (status 410)"; err.Error() != want {
+			t.Fatalf("error = %q, want %q", err.Error(), want)
+		}
+	})
+
+	t.Run("425 connection window not open carries its code without a retry", func(t *testing.T) {
+		const message = "Connections to this pass open at 2026-11-14 03:00:00 UTC, 24 hours before AOS."
+		calls := 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			calls++
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooEarly)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error": "connection_window_not_open", "message": message, "opensAt": "2026-11-14T03:00:00Z",
+			})
+		}))
+		defer server.Close()
+		_, err := fetchAuthorizerCredentials(
+			t.Context(),
+			server.URL,
+			testTokenSource(),
+			AuthorizerRequest{PassID: "pass-123"},
+		)
+		if !isAuthorizerError(err, authorizerErrorConnectionWindowNotOpen) {
+			t.Fatalf("expected a connection_window_not_open authorizer error, got %v", err)
+		}
+		if want := message + " (status 425)"; err.Error() != want {
+			t.Fatalf("error = %q, want %q", err.Error(), want)
+		}
+		if calls != 1 {
+			t.Fatalf("authorizer called %d times, want 1", calls)
+		}
+	})
+
 	t.Run("missing credentials", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "application/json")

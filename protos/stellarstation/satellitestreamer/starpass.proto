@@ -314,6 +314,146 @@ message Ack {
   // high_rate_telemetry, uplink, gs_config_request, monitoring,
   // configuration, event.
   string message_type = 12;
+
+  // Uplink and config_request acks only: the furthest stage the station
+  // reports for this message on the "/status" topic. UNSPECIFIED means it
+  // reports none, so do not wait for one.
+  CommandStage expected_final_stage = 13;
+
+  // Stable machine-readable form of reason, set on every NACK.
+  string reason_code = 14;
+}
+
+// How far a command or configuration request got after its receipt ack.
+enum CommandStage {
+  COMMAND_STAGE_UNSPECIFIED = 0;
+  // Handed to the station device.
+  COMMAND_STAGE_DISPATCHED = 1;
+  // Transmitted on RF. CommandStatus.radiated_at holds the device time.
+  COMMAND_STAGE_RADIATED = 2;
+  // Configuration applied by the device.
+  COMMAND_STAGE_APPLIED = 3;
+}
+
+enum CommandOutcome {
+  COMMAND_OUTCOME_UNSPECIFIED = 0;
+  // Reached the stage; more statuses follow.
+  COMMAND_OUTCOME_IN_PROGRESS = 1;
+  // Final: reached the furthest stage the station reports.
+  COMMAND_OUTCOME_SUCCEEDED = 2;
+  // Final: some configuration fields applied and others were refused, or, as
+  // a message_outcome, some frames succeeded and the others failed.
+  COMMAND_OUTCOME_PARTIAL = 3;
+  // Final: the stage refused it, or it never left the stage.
+  COMMAND_OUTCOME_FAILED = 4;
+  // Final: the stage is the last one confirmed and the outcome cannot be
+  // known. The command may have been transmitted; do not resend blindly.
+  COMMAND_OUTCOME_UNKNOWN = 5;
+}
+
+enum CommandFailure {
+  COMMAND_FAILURE_UNSPECIFIED = 0;
+  // The pass ended before the command was sent.
+  COMMAND_FAILURE_PLAN_ENDED = 1;
+  // A newer stream took over the channel before the command was sent.
+  COMMAND_FAILURE_SUPERSEDED = 2;
+  // The device rejected the command as malformed.
+  COMMAND_FAILURE_INVALID_COMMAND = 3;
+  // The device encoder was locked out.
+  COMMAND_FAILURE_ENCODER_LOCKED_OUT = 4;
+  // The device refused the command for another reason; see provider_code.
+  COMMAND_FAILURE_REJECTED_BY_DEVICE = 5;
+  // The latest allowed transmission time passed.
+  COMMAND_FAILURE_DEADLINE_EXCEEDED = 6;
+  // No device at the station handles this configuration field.
+  COMMAND_FAILURE_UNSUPPORTED = 7;
+  // The configuration value is outside what the device accepts.
+  COMMAND_FAILURE_OUT_OF_RANGE = 8;
+  // The device did not acknowledge in time.
+  COMMAND_FAILURE_NO_DEVICE_ACK = 9;
+  // The station failed for a reason not covered above; see reason.
+  COMMAND_FAILURE_STATION_ERROR = 10;
+}
+
+// Progress of uplink and config_request messages after their receipt ack,
+// published on the request topic with "/status" appended. Each status is for
+// one frame, and every frame of every ACKed message gets exactly one final
+// status. A message's statuses are published in the order they happened.
+message CommandStatusBatch {
+  repeated CommandStatus statuses = 1;
+
+  // Indexes the station declared missing since the previous batch. Later
+  // messages were sent without them; if one arrives now it is NACKed.
+  repeated SkippedRange skipped = 2;
+}
+
+message CommandStatus {
+  // ToStarPassMessage.message_id of the message this status is for.
+  string acked_message_id = 1;
+  string stream_id = 2;
+  string pass_id = 3;
+  // ToStarPassMessage.index.
+  uint64 index = 4;
+  string channel_id = 5;
+  // "uplink" or "gs_config_request".
+  string message_type = 6;
+
+  reserved 7, 8;
+  reserved "first_frame", "last_frame";
+  // The frame this status is for: its 0-based position in
+  // ToStarPassMessage.command. A configuration request is one frame.
+  uint32 frame_index = 22;
+  // Frames in the whole message.
+  uint32 frame_count = 9;
+
+  CommandStage stage = 10;
+  CommandOutcome outcome = 11;
+  // No further statuses follow for this frame.
+  bool final = 12;
+  // This status made every frame of the message final. Exactly one status
+  // per message sets it, and none follows it.
+  bool message_final = 13;
+
+  // Station clock when the stage was observed.
+  google.protobuf.Timestamp observed_at = 14;
+  // Device clock, set with COMMAND_STAGE_RADIATED.
+  google.protobuf.Timestamp radiated_at = 15;
+
+  CommandFailure failure = 16;
+  // Raw device code, e.g. "cortex-tcu:12".
+  string provider_code = 17;
+  string reason = 18;
+
+  // Configuration requests only: the outcome of each field that was set.
+  repeated ConfigFieldResult config_fields = 19;
+
+  // This status's own unique ID (UUID v4).
+  string message_id = 20;
+
+  // Set with message_final, the whole message's outcome: UNKNOWN if any frame
+  // is unknown, since it may have been transmitted; else SUCCEEDED or FAILED
+  // when every frame did; else PARTIAL, and only the failed frames are safe
+  // to resend.
+  CommandOutcome message_outcome = 21;
+}
+
+message ConfigFieldResult {
+  // Field path, e.g. "transmitter.bitrate".
+  string field = 1;
+  CommandOutcome outcome = 2;
+  CommandFailure failure = 3;
+  string provider_code = 4;
+  string reason = 5;
+}
+
+message SkippedRange {
+  string stream_id = 1;
+  string channel_id = 2;
+  // "uplink" or "gs_config_request".
+  string message_type = 3;
+  // Inclusive.
+  uint64 first_index = 4;
+  uint64 last_index = 5;
 }
 
 // A request to send commands to a satellite. Published to the pass-specific MQTT topics

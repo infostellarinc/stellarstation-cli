@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"sort"
@@ -50,6 +51,18 @@ func commandableChannelSet(creds *AuthorizerCredentials) func(string) bool {
 		}
 		return uplink[channelID]
 	}
+}
+
+// firstCommandable returns the first config on a commandable channel, or the
+// zero config if there is none.
+func firstCommandable(creds *AuthorizerCredentials, configs []CommandConfig) CommandConfig {
+	commandable := commandableChannelSet(creds)
+	for _, c := range configs {
+		if commandable(ExtractChannelIDFromTopic(c.PublishTopic)) {
+			return c
+		}
+	}
+	return CommandConfig{}
 }
 
 // resolveAllCommandTargets extracts per-channel command topics from authorizer credentials.
@@ -181,6 +194,26 @@ func setupMQTTClient(
 	return client, nil
 }
 
+// subscribeCommandReplies listens on client for the acks and statuses of
+// this stream's commands, so a sender sees its results without a separate
+// reader connection. Replies a reader also delivers are counted once.
+func subscribeCommandReplies(client mqtt.Client, cfg Config, stats *statsTracker) {
+	if cfg.AuthorizerCreds == nil {
+		return
+	}
+	topics := collapseChannelWildcards(commandReplyTopics(cfg.AuthorizerCreds.Streams))
+	if len(topics) == 0 {
+		return
+	}
+	handler := func(_ mqtt.Client, msg mqtt.Message) {
+		routeCommandReply(stats, msg.Topic(), msg.Payload())
+	}
+	if err := subscribeMQTT(client, topics, cfg.MQTTQoS, handler); err != nil {
+		uiWarnf("Command acknowledgements cannot be received on this connection; results may not be shown.")
+		vlogf("command reply subscription failed: %v", err)
+	}
+}
+
 func normalizeIDs(cfg Config, streamID, planID, passID string) (string, string) {
 	if streamID == "" {
 		// Use stream ID from authorizer (same as telemetry acks use)
@@ -204,148 +237,99 @@ func parseHexCommand(hexStr string) ([]byte, error) {
 	return hex.DecodeString(hexStr)
 }
 
-func createSendSatCommandFunc(
-	ctx context.Context,
-	client mqtt.Client,
-	topic string, // Topic from authorizer
-	streamID, planID string,
-	cfg Config,
-	stats *statsTracker,
-) func(string, uint32) error {
-	return func(cmdHex string, index uint32) error {
+// commandSendFunc sends one command payload with the given index.
+type commandSendFunc func(payload string, index uint32) (*sentCommand, error)
+
+func createSendSatCommandFunc(pub *commandPublisher, topic, streamID, planID string) commandSendFunc {
+	return func(cmdHex string, index uint32) (*sentCommand, error) {
 		cmdBytes, err := parseHexCommand(cmdHex)
 		if err != nil {
-			return fmt.Errorf("invalid hex command %q: %w", cmdHex, err)
+			return nil, fmt.Errorf("invalid hex command %q: %w", cmdHex, err)
 		}
 		// Checked before the echo below, so an oversized payload is never
 		// reported as being sent.
 		if err := validateCommandSize([][]byte{cmdBytes}); err != nil {
-			return err
+			return nil, err
 		}
 		//nolint:gosec // G706: cmdHex is a trusted hex-encoded command from user input
 		uiDataf(kindUplink, "sending command %d: %s (%d bytes)", index, cmdHex, len(cmdBytes))
-		return PublishSatCommand(
-			ctx,
-			client,
-			topic,
-			streamID,
-			planID,
-			index,
-			[][]byte{cmdBytes},
-			cfg.MQTTQoS,
-			stats,
-		)
+		return PublishSatCommand(pub, topic, streamID, planID, index, [][]byte{cmdBytes})
 	}
 }
 
-func createSendGsConfigFunc(
-	ctx context.Context,
-	client mqtt.Client,
-	topic string, // Topic from authorizer
-	streamID, planID string,
-	cfg Config,
-	stats *statsTracker,
-) func(string, uint32) error {
-	return func(configJSON string, index uint32) error {
+func createSendGsConfigFunc(pub *commandPublisher, topic, streamID, planID string) commandSendFunc {
+	return func(configJSON string, index uint32) (*sentCommand, error) {
 		configRequest := &v1.GroundStationConfigurationRequest{}
 		if configJSON == "" {
 			uiDataf(kindUplink, "sending ground-station config request %d (empty)", index)
 		} else {
 			if err := protojson.Unmarshal([]byte(configJSON), configRequest); err != nil {
-				return fmt.Errorf("that config request is not valid JSON: %w", err)
+				return nil, fmt.Errorf("that config request is not valid JSON: %w", err)
 			}
 			//nolint:gosec // G706: configJSON is a trusted JSON config from user input
 			uiDataf(kindUplink, "sending ground-station config request %d: %s", index, configJSON)
 		}
-		return PublishGsConfig(
-			ctx,
-			client,
-			topic,
-			streamID,
-			planID,
-			index,
-			configRequest,
-			cfg.MQTTQoS,
-			stats,
-		)
+		return PublishGsConfig(pub, topic, streamID, planID, index, configRequest)
 	}
 }
 
-func handleOneShotSatCommand(
-	sendSatCommand string,
-	sendSatCommandFunc func(string, uint32) error,
-) error {
+// waitingNote is shown once a one-shot send is published.
+func waitingNote(sent string, mode waitMode) string {
+	if mode == waitForFinal {
+		return sent + " Waiting for acknowledgement and delivery status..."
+	}
+	return sent + " Waiting for acknowledgement..."
+}
+
+func handleOneShotSatCommand(sendSatCommand string, send commandSendFunc, mode waitMode) ([]*sentCommand, error) {
 	if sendSatCommand == "" {
-		return nil
+		return nil, nil
 	}
-	if err := sendSatCommandFunc(sendSatCommand, 1); err != nil {
-		return err
+	cmd, err := send(sendSatCommand, 1)
+	if err != nil {
+		return nil, err
 	}
-	uiOKf("Command sent. Waiting for acknowledgement...")
-	time.Sleep(commandAckWait)
-	return nil
+	uiOKf("%s", waitingNote("Command sent.", mode))
+	return []*sentCommand{cmd}, nil
 }
 
-func handleOneShotSatCommands(
-	sendSatCommands string,
-	sendSatCommandFunc func(string, uint32) error,
-) error {
+func handleOneShotSatCommands(sendSatCommands string, send commandSendFunc, mode waitMode) ([]*sentCommand, error) {
 	if sendSatCommands == "" {
-		return nil
+		return nil, nil
 	}
 	commands := strings.Split(sendSatCommands, ",")
+	sent := make([]*sentCommand, 0, len(commands))
 	for i, cmdHex := range commands {
-		if err := sendSatCommandFunc(cmdHex, uint32(i+1)); err != nil {
-			return err
+		cmd, err := send(cmdHex, uint32(i+1))
+		if err != nil {
+			return sent, err
 		}
+		sent = append(sent, cmd)
 		time.Sleep(interCommandDelay)
 	}
-	uiOKf("All commands sent. Waiting for acknowledgements...")
-	time.Sleep(commandAckWait)
-	return nil
+	uiOKf("%s", waitingNote("All commands sent.", mode))
+	return sent, nil
 }
 
-func handleOneShotGsConfig(sendGsConfig string, sendGsConfigFunc func(string, uint32) error) error {
+func handleOneShotGsConfig(sendGsConfig string, send commandSendFunc, mode waitMode) ([]*sentCommand, error) {
 	if sendGsConfig == "" {
-		return nil
+		return nil, nil
 	}
-	if err := sendGsConfigFunc(sendGsConfig, 1); err != nil {
-		return err
+	cmd, err := send(sendGsConfig, 1)
+	if err != nil {
+		return nil, err
 	}
-	uiOKf("Ground-station config request sent. Waiting for acknowledgement...")
-	time.Sleep(commandAckWait)
-	return nil
+	uiOKf("%s", waitingNote("Ground-station config request sent.", mode))
+	return []*sentCommand{cmd}, nil
 }
 
-// resolveCommandTopics extracts uplink and config_request publish topics from authorizer credentials.
-//
-// Parameters:
-//   - cfg: The configuration containing authorizer credentials
-//
-// Returns:
-//   - satCommandTopic: The MQTT topic for publishing satellite commands
-//   - gsConfigTopic: The MQTT topic for publishing ground station configuration
-//   - err: An error if topics are not available when required
-func resolveCommandTopics(
-	cfg Config,
-) (satCommandTopic, gsConfigTopic string, err error) {
+// resolveCommandTopics returns the uplink and config_request publish topics
+// on the first commandable channel, or an error when an enabled path has none.
+func resolveCommandTopics(cfg Config) (satCommandTopic, gsConfigTopic string, err error) {
 	if cfg.AuthorizerCreds != nil {
-		// Prefer the uplink-direction channel's topic rather than index 0, since the
-		// authorizer returns a command topic per channel and index 0 may be a
-		// downlink channel that cannot actually be commanded.
-		commandable := commandableChannelSet(cfg.AuthorizerCreds)
-		for _, ul := range cfg.AuthorizerCreds.Streams.Uplink {
-			if commandable(ExtractChannelIDFromTopic(ul.PublishTopic)) {
-				satCommandTopic = ul.PublishTopic
-				break
-			}
-		}
-		for _, cr := range cfg.AuthorizerCreds.Streams.ConfigRequest {
-			if commandable(ExtractChannelIDFromTopic(cr.PublishTopic)) {
-				gsConfigTopic = cr.PublishTopic
-				break
-			}
-		}
+		creds := cfg.AuthorizerCreds
+		satCommandTopic = firstCommandable(creds, creds.Streams.Uplink).PublishTopic
+		gsConfigTopic = firstCommandable(creds, creds.Streams.ConfigRequest).PublishTopic
 	}
 	if cfg.EnableUplink && satCommandTopic == "" {
 		return "", "", errors.New("uplink topic not provided by authorizer")
@@ -357,27 +341,35 @@ func resolveCommandTopics(
 	return satCommandTopic, gsConfigTopic, nil
 }
 
-// dispatchOneShotCommands sends one-shot commands and returns true if any was sent.
+// dispatchOneShotCommands sends the one-shot commands, the first non-empty
+// of sendSatCommand, sendSatCommands and sendGsConfig, then waits for their
+// results. It reports whether anything was sent.
 func dispatchOneShotCommands(
 	sendSatCommand, sendSatCommands, sendGsConfig string,
-	sendSatCommandFunc, sendGsConfigFunc func(string, uint32) error,
+	sendSatCommandFunc, sendGsConfigFunc commandSendFunc,
+	mode waitMode,
+	await func([]*sentCommand) error,
 ) (bool, error) {
-	if err := handleOneShotSatCommand(sendSatCommand, sendSatCommandFunc); err != nil {
-		return false, err
+	var sent []*sentCommand
+	var err error
+	switch {
+	case sendSatCommand != "":
+		sent, err = handleOneShotSatCommand(sendSatCommand, sendSatCommandFunc, mode)
+	case sendSatCommands != "":
+		sent, err = handleOneShotSatCommands(sendSatCommands, sendSatCommandFunc, mode)
+	case sendGsConfig != "":
+		sent, err = handleOneShotGsConfig(sendGsConfig, sendGsConfigFunc, mode)
+	default:
+		return false, nil
 	}
-	if sendSatCommand != "" {
-		return true, nil
+	if err != nil {
+		if len(sent) > 0 {
+			// Commands already published still get their results.
+			_ = await(sent)
+		}
+		return len(sent) > 0, err
 	}
-	if err := handleOneShotSatCommands(sendSatCommands, sendSatCommandFunc); err != nil {
-		return false, err
-	}
-	if sendSatCommands != "" {
-		return true, nil
-	}
-	if err := handleOneShotGsConfig(sendGsConfig, sendGsConfigFunc); err != nil {
-		return false, err
-	}
-	return sendGsConfig != "", nil
+	return true, await(sent)
 }
 
 // runCommandSender connects to MQTT and sends commands.
@@ -444,6 +436,8 @@ func runCommandSender(
 	if stats == nil {
 		stats = newStatsTracker(false)
 	}
+	subscribeCommandReplies(client, cfg, stats)
+	mode := effectiveWaitMode(cfg)
 
 	streamID, planID = normalizeIDs(cfg, streamID, planID, passID)
 
@@ -452,18 +446,21 @@ func runCommandSender(
 		return err
 	}
 
+	pub := newCommandPublisher(client, cfg.MQTTQoS, stats, window)
+
 	// Create command functions using the topics from authorizer.
 	// Authorizer provides topic for the configured channel. Each channel has its own topic,
 	// and indices are automatically per-channel (each topic has its own independent index sequence).
-	sendSatCommandFunc := createSendSatCommandFunc(ctx, client, satCommandTopic, streamID, planID, cfg, stats)
-	sendGsConfigFunc := createSendGsConfigFunc(ctx, client, gsConfigTopic, streamID, planID, cfg, stats)
-
 	sent, err := dispatchOneShotCommands(
 		sendSatCommand,
 		sendSatCommands,
 		sendGsConfig,
-		sendSatCommandFunc,
-		sendGsConfigFunc,
+		createSendSatCommandFunc(pub, satCommandTopic, streamID, planID),
+		createSendGsConfigFunc(pub, gsConfigTopic, streamID, planID),
+		mode,
+		func(cmds []*sentCommand) error {
+			return awaitCommands(stats, cmds, mode, cfg.WaitTimeout, pub.clock)
+		},
 	)
 	if err != nil || sent || !interactive {
 		return err
@@ -474,13 +471,25 @@ func runCommandSender(
 		return fmt.Errorf("resolving command targets: %w", terr)
 	}
 
-	return runInteractiveMode(ctx, cfg, targets, client, streamID, planID, passID, stats, window)
+	return runInteractiveMode(ctx, targets, pub, cfg, streamID, planID, passID)
 }
 
 // exampleGsConfigJSON is a realistic ground-station radio-config payload shown
 // in interactive-mode help, so the example is something a receiver can
 // actually act on rather than an empty, un-illustrative "{}".
 const exampleGsConfigJSON = `{"receiverConfigurationRequest":{"bitrate":9600,"modulation":"BPSK"}}`
+
+// interactiveOut is where interactive mode writes its prompt, replies and
+// errors: through the live stats panel's writer, so the once-a-second redraw
+// of the panel does not paint over them.
+var interactiveOut io.Writer = stderrPanelWriter{}
+
+// stderrPanelWriter writes to the current os.Stderr through the stats panel.
+type stderrPanelWriter struct{}
+
+func (stderrPanelWriter) Write(p []byte) (int, error) {
+	return statusClearingWriter{w: os.Stderr}.Write(p)
+}
 
 // runInteractiveMode handles interactive command input from stdin.
 // The user must specify a channel ID for each command.
@@ -492,14 +501,12 @@ const exampleGsConfigJSON = `{"receiverConfigurationRequest":{"bitrate":9600,"mo
 //	exit/quit                - Exit interactive mode
 func runInteractiveMode(
 	ctx context.Context,
-	cfg Config,
 	targets []channelTarget,
-	client mqtt.Client,
+	pub *commandPublisher,
+	cfg Config,
 	streamID, planID, passID string,
-	stats *statsTracker,
-	window passWindow,
 ) error {
-	s := newInteractiveSession(cfg, targets, client, streamID, planID, stats, window)
+	s := newInteractiveSession(cfg, targets, pub, streamID, planID)
 	s.printBanner(passID)
 
 	scanner := newCommandScanner(os.Stdin)
@@ -510,7 +517,7 @@ func runInteractiveMode(
 		default:
 		}
 
-		fmt.Fprint(os.Stderr, "> ")
+		fmt.Fprint(interactiveOut, "> ")
 		if !scanner.Scan() {
 			break
 		}
@@ -528,11 +535,11 @@ func runInteractiveMode(
 
 		switch cmdType {
 		case "sat":
-			s.sendSatCommand(ctx, parts[1:])
+			s.sendSatCommand(parts[1:])
 		case "gs":
-			s.sendGsConfig(ctx, parts[1:])
+			s.sendGsConfig(parts[1:])
 		default:
-			fmt.Fprintf(os.Stderr, "Unknown command %q; use 'sat', 'gs', or 'exit'\n", cmdType)
+			fmt.Fprintf(interactiveOut, "Unknown command %q; use 'sat', 'gs', or 'exit'\n", cmdType)
 		}
 	}
 
@@ -549,11 +556,9 @@ func runInteractiveMode(
 type interactiveSession struct {
 	cfg      Config
 	targets  []channelTarget
-	client   mqtt.Client
+	pub      *commandPublisher
 	streamID string
 	planID   string
-	stats    *statsTracker
-	window   passWindow
 
 	// Per-channel message indices. Each topic carries its own independent
 	// sequence, so uplink and config requests are counted separately.
@@ -569,19 +574,15 @@ type interactiveSession struct {
 func newInteractiveSession(
 	cfg Config,
 	targets []channelTarget,
-	client mqtt.Client,
+	pub *commandPublisher,
 	streamID, planID string,
-	stats *statsTracker,
-	window passWindow,
 ) *interactiveSession {
 	s := &interactiveSession{
 		cfg:             cfg,
 		targets:         targets,
-		client:          client,
+		pub:             pub,
 		streamID:        streamID,
 		planID:          planID,
-		stats:           stats,
-		window:          window,
 		satIndices:      make(map[int]uint32, len(targets)),
 		gsIndices:       make(map[int]uint32, len(targets)),
 		singleUplinkIdx: singleTargetIndex(targets, func(t channelTarget) bool { return t.UplinkTopic != "" }),
@@ -599,25 +600,28 @@ func newInteractiveSession(
 // printBanner announces the session: whether commanding is currently open, the
 // channels available, and the syntax for each command type.
 func (s *interactiveSession) printBanner(passID string) {
-	fmt.Fprintf(os.Stderr, "Interactive mode: Enter commands (Ctrl-C to exit)\n")
+	fmt.Fprintf(interactiveOut, "Interactive mode: Enter commands (Ctrl-C to exit)\n")
 	// Say up front when the booking is not open, rather than letting the
 	// operator discover it by having their first command rejected.
-	if err := s.window.check(time.Now()); err != nil {
-		fmt.Fprintf(os.Stderr, "NOTE: %v\n", err)
-	} else if s.window.resolved() {
-		fmt.Fprintf(os.Stderr, "Commanding is open until %s.\n", s.window.stop.UTC().Format(timeFormat))
+	if err := s.pub.window.check(time.Now()); err != nil {
+		fmt.Fprintf(interactiveOut, "NOTE: %v\n", err)
+	} else if s.pub.window.resolved() {
+		fmt.Fprintf(interactiveOut, "Commanding is open until %s.\n", s.pub.window.stop.UTC().Format(timeFormat))
+	} else {
+		// Say so rather than leave the operator to assume commands are checked.
+		fmt.Fprintf(interactiveOut, "NOTE: could not read the pass's times, so commands are sent whenever you type them\n")
 	}
 	s.printChannels()
 	s.printCommandHelp()
-	fmt.Fprintf(os.Stderr, "Stream ID: %s\n", s.streamID)
-	fmt.Fprintf(os.Stderr, "Pass ID: %s\n", passID)
-	fmt.Fprintf(os.Stderr, "\n")
+	fmt.Fprintf(interactiveOut, "Stream ID: %s\n", s.streamID)
+	fmt.Fprintf(interactiveOut, "Pass ID: %s\n", passID)
+	fmt.Fprintf(interactiveOut, "\n")
 }
 
 func (s *interactiveSession) printChannels() {
-	fmt.Fprintf(os.Stderr, "\nAvailable channels:\n")
+	fmt.Fprintf(interactiveOut, "\nAvailable channels:\n")
 	if len(s.targets) == 0 {
-		fmt.Fprintf(os.Stderr, "  none: this stream has no channel that accepts commands\n")
+		fmt.Fprintf(interactiveOut, "  none: this stream has no channel that accepts commands\n")
 		return
 	}
 	for _, t := range s.targets {
@@ -628,32 +632,37 @@ func (s *interactiveSession) printChannels() {
 		if t.ConfigRequestTopic != "" {
 			caps = append(caps, "config_request")
 		}
-		fmt.Fprintf(os.Stderr, "  %s (%s)\n", t.ChannelID, strings.Join(caps, ", "))
+		fmt.Fprintf(interactiveOut, "  %s (%s)\n", t.ChannelID, strings.Join(caps, ", "))
 	}
 }
 
 func (s *interactiveSession) printCommandHelp() {
-	fmt.Fprintf(os.Stderr, "\nCommands:\n")
+	fmt.Fprintf(interactiveOut, "\nCommands:\n")
 	exampleChID := "<channel-id>"
 	if len(s.targets) > 0 {
 		exampleChID = s.targets[0].ChannelID
 	}
-	if s.singleUplinkIdx >= 0 {
-		fmt.Fprintf(os.Stderr, "  sat <hex>                - Send satellite command (e.g., 'sat aaaabbbb')\n")
-	} else {
+	// Only the kinds of command this stream may send are offered.
+	switch {
+	case !s.cfg.EnableUplink:
+	case s.singleUplinkIdx >= 0:
+		fmt.Fprintf(interactiveOut, "  sat <hex>                - Send satellite command (e.g., 'sat aaaabbbb')\n")
+	default:
 		fmt.Fprintf(
 			os.Stderr,
 			"  sat <channel-id> <hex>   - Send satellite command (e.g., 'sat %s aaaabbbb')\n",
 			exampleChID,
 		)
 	}
-	if s.singleGsIdx >= 0 {
+	switch {
+	case !s.cfg.EnableConfigRequests:
+	case s.singleGsIdx >= 0:
 		fmt.Fprintf(
 			os.Stderr,
 			"  gs  [json]               - Send ground station config (e.g., 'gs %s')\n",
 			exampleGsConfigJSON,
 		)
-	} else {
+	default:
 		fmt.Fprintf(
 			os.Stderr,
 			"  gs  <channel-id> <json>  - Send ground station config (e.g., 'gs %s %s')\n",
@@ -661,7 +670,7 @@ func (s *interactiveSession) printCommandHelp() {
 			exampleGsConfigJSON,
 		)
 	}
-	fmt.Fprintf(os.Stderr, "  exit/quit                - Exit interactive mode\n")
+	fmt.Fprintf(interactiveOut, "  exit/quit                - Exit interactive mode\n")
 }
 
 // hasUplinkTarget reports whether any channel of this stream accepts satellite
@@ -689,17 +698,17 @@ func (s *interactiveSession) hasConfigRequestTarget() bool {
 // sendSatCommand handles one "sat" line. Every rejection is reported to stderr
 // and returns without transmitting, leaving the session running so the operator
 // can correct the line and try again.
-func (s *interactiveSession) sendSatCommand(ctx context.Context, args []string) {
+func (s *interactiveSession) sendSatCommand(args []string) {
 	if !s.cfg.EnableUplink {
-		fmt.Fprintf(os.Stderr, "ERROR: uplink disabled (-disable-uplink)\n")
+		fmt.Fprintf(interactiveOut, "ERROR: uplink disabled (-disable-uplink)\n")
 		return
 	}
 	if !s.hasUplinkTarget() {
-		fmt.Fprintf(os.Stderr, "ERROR: this stream has no uplink channel; satellite commands cannot be sent\n")
+		fmt.Fprintf(interactiveOut, "ERROR: this stream has no uplink channel; satellite commands cannot be sent\n")
 		return
 	}
-	if err := s.window.check(time.Now()); err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+	if err := s.pub.window.check(time.Now()); err != nil {
+		fmt.Fprintf(interactiveOut, "ERROR: %v\n", err)
 		return
 	}
 	chIdx, hexPayload, ok := resolveCommandArgs(args, s.targets, s.singleUplinkIdx, "sat")
@@ -708,34 +717,41 @@ func (s *interactiveSession) sendSatCommand(ctx context.Context, args []string) 
 	}
 	target := s.targets[chIdx]
 	if target.UplinkTopic == "" {
-		fmt.Fprintf(os.Stderr, "ERROR: channel %s has no uplink topic\n", target.ChannelID)
+		fmt.Fprintf(interactiveOut, "ERROR: channel %s has no uplink topic\n", target.ChannelID)
 		return
 	}
 	cmdBytes, err := parseHexCommand(hexPayload)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: invalid hex: %v\n", err)
+		fmt.Fprintf(interactiveOut, "ERROR: invalid hex: %v\n", err)
 		return
 	}
 	if err := validateCommandSize([][]byte{cmdBytes}); err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		fmt.Fprintf(interactiveOut, "ERROR: %v\n", err)
 		return
 	}
 	idx := s.satIndices[chIdx]
 	uiDataf(kindUplink, "sending command %d to channel %s: %s (%d bytes)",
 		idx, target.ChannelID, hexPayload, len(cmdBytes))
-	if err := PublishSatCommand(ctx, s.client, target.UplinkTopic, s.streamID, s.planID,
-		idx, [][]byte{cmdBytes}, s.cfg.MQTTQoS, s.stats); err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-		return
+	cmd, err := PublishSatCommand(s.pub, target.UplinkTopic, s.streamID, s.planID,
+		idx, [][]byte{cmdBytes})
+	if err != nil {
+		fmt.Fprintf(interactiveOut, "ERROR: %v\n", err)
 	}
-	s.satIndices[chIdx]++
+	// A command the broker did not confirm may still arrive, so its index
+	// stays used (see publishCommand); only one never sent frees it.
+	if cmd != nil {
+		s.satIndices[chIdx]++
+		if err == nil {
+			fmt.Fprintf(interactiveOut, "  sent; waiting for the ground station to acknowledge it\n")
+		}
+	}
 }
 
 // sendGsConfig handles one "gs" line, with the same reject-and-continue
 // behaviour as sendSatCommand.
-func (s *interactiveSession) sendGsConfig(ctx context.Context, args []string) {
+func (s *interactiveSession) sendGsConfig(args []string) {
 	if !s.cfg.EnableConfigRequests {
-		fmt.Fprintf(os.Stderr, "ERROR: config_request disabled (-disable-config-requests)\n")
+		fmt.Fprintf(interactiveOut, "ERROR: config_request disabled (-disable-config-requests)\n")
 		return
 	}
 	if !s.hasConfigRequestTarget() {
@@ -745,8 +761,8 @@ func (s *interactiveSession) sendGsConfig(ctx context.Context, args []string) {
 		)
 		return
 	}
-	if err := s.window.check(time.Now()); err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+	if err := s.pub.window.check(time.Now()); err != nil {
+		fmt.Fprintf(interactiveOut, "ERROR: %v\n", err)
 		return
 	}
 	chIdx, payload, ok := resolveCommandArgs(args, s.targets, s.singleGsIdx, "gs")
@@ -755,25 +771,30 @@ func (s *interactiveSession) sendGsConfig(ctx context.Context, args []string) {
 	}
 	target := s.targets[chIdx]
 	if target.ConfigRequestTopic == "" {
-		fmt.Fprintf(os.Stderr, "ERROR: channel %s has no config_request topic\n", target.ChannelID)
+		fmt.Fprintf(interactiveOut, "ERROR: channel %s has no config_request topic\n", target.ChannelID)
 		return
 	}
 	configRequest := &v1.GroundStationConfigurationRequest{}
 	if payload != "" {
 		if err := protojson.Unmarshal([]byte(payload), configRequest); err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: invalid JSON: %v\n", err)
+			fmt.Fprintf(interactiveOut, "ERROR: invalid JSON: %v\n", err)
 			return
 		}
 	}
 	idx := s.gsIndices[chIdx]
 	uiDataf(kindUplink, "sending config request %d to channel %s: %s",
 		idx, target.ChannelID, payload)
-	if err := PublishGsConfig(ctx, s.client, target.ConfigRequestTopic, s.streamID, s.planID,
-		idx, configRequest, s.cfg.MQTTQoS, s.stats); err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-		return
+	cmd, err := PublishGsConfig(s.pub, target.ConfigRequestTopic, s.streamID, s.planID,
+		idx, configRequest)
+	if err != nil {
+		fmt.Fprintf(interactiveOut, "ERROR: %v\n", err)
 	}
-	s.gsIndices[chIdx]++
+	if cmd != nil {
+		s.gsIndices[chIdx]++
+		if err == nil {
+			fmt.Fprintf(interactiveOut, "  sent; waiting for the ground station to acknowledge it\n")
+		}
+	}
 }
 
 // parseChannelID looks up a channel by its ID string and returns the
@@ -789,7 +810,7 @@ func parseChannelID(s string, targets []channelTarget) (int, channelTarget, bool
 	for i, t := range targets {
 		ids[i] = t.ChannelID
 	}
-	fmt.Fprintf(os.Stderr, "ERROR: unknown channel %q (available: %s)\n", s, strings.Join(ids, ", "))
+	fmt.Fprintf(interactiveOut, "ERROR: unknown channel %q (available: %s)\n", s, strings.Join(ids, ", "))
 	return 0, channelTarget{}, false
 }
 
@@ -817,7 +838,7 @@ func resolveCommandArgs(args []string, targets []channelTarget, defaultIdx int, 
 		if defaultIdx >= 0 {
 			return defaultIdx, "", true
 		}
-		fmt.Fprintf(os.Stderr, "Usage: %s <channel-id> <payload>\n", cmdName)
+		fmt.Fprintf(interactiveOut, "Usage: %s <channel-id> <payload>\n", cmdName)
 		return 0, "", false
 	}
 
@@ -883,9 +904,23 @@ func resolveBookingWindow(ctx context.Context, cfg Config, passID string) passWi
 	fetchCtx, cancel := context.WithTimeout(ctx, authorizerClientTimeout)
 	defer cancel()
 	p, err := apiclient.New(cfg.AuthorizerAPI, cfg.TokenSource).GetPass(fetchCtx, passID)
-	if err != nil || p == nil || p.Booking == nil {
+	if err != nil || p == nil {
 		vlogf("command window: could not resolve the booking times (%v); the window check is disabled", err)
 		return passWindow{}
 	}
-	return passWindow{start: p.Booking.Start, stop: p.Booking.Stop}
+	return passWindowOf(p)
+}
+
+// passWindowOf is when the pass takes commands: its booking, or its scheduled
+// contact for passes that carry no booking. Unresolved when it has neither.
+func passWindowOf(p *apiclient.Pass) passWindow {
+	switch {
+	case p.Booking != nil:
+		return passWindow{start: p.Booking.Start, stop: p.Booking.Stop}
+	case p.Scheduled != nil:
+		return passWindow{start: p.Scheduled.Start, stop: p.Scheduled.Stop}
+	default:
+		vlogf("command window: the pass has no booking or scheduled times; the window check is disabled")
+		return passWindow{}
+	}
 }

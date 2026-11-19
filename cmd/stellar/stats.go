@@ -11,6 +11,11 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
+
+	"google.golang.org/protobuf/proto"
+
+	streaming "github.com/infostellarinc/stellarstation-cli/gen/pb/stellarstation/satellitestreamer"
+	"github.com/infostellarinc/stellarstation-cli/internal/commandseq"
 )
 
 // MessageSource indicates where a message came from
@@ -100,6 +105,7 @@ type statsTracker struct {
 	// Ack counts
 	acksReceived  int
 	nacksReceived int
+	lateNacks     int // NACKs that were arrived_late, a subset of nacksReceived
 	acksSent      int
 
 	// Track received messages that should be acked (but we don't currently send acks)
@@ -178,14 +184,46 @@ type receivedMessage struct {
 	acked     bool
 }
 
-// sentCommand tracks a command that was sent and is waiting for an ack
+// sentCommand tracks a command that was sent and what the station reported
+// about it. Fields are guarded by statsTracker.mu.
 type sentCommand struct {
 	topic     string
 	cmdType   string // "uplink", "config_request"
 	index     uint32
+	messageID string
+	streamID  string
 	timestamp int64
 	acked     bool
 	rejected  bool
+	// nackReason and nackReasonCode are the station's reason for a rejection.
+	nackReason     string
+	nackReasonCode string
+	// expectedFinalStage is the furthest stage the station reports on the
+	// status topic; unspecified means it reports none.
+	expectedFinalStage streaming.CommandStage
+	delivery           commandDelivery
+	// answered is closed once the station has answered the command, finished
+	// once nothing more will be reported about it.
+	answered chan struct{}
+	finished chan struct{}
+	// seen holds the acks already counted, so a replayed ack (the station
+	// answers a redelivery with the original bytes, and two connections can
+	// deliver it) counts once.
+	seen map[string]bool
+}
+
+// firstSighting reports whether payload is a new ack for this command,
+// recording it. Callers hold the tracker's mu.
+func (c *sentCommand) firstSighting(payload []byte) bool {
+	key := string(payload)
+	if c.seen[key] {
+		return false
+	}
+	if c.seen == nil {
+		c.seen = make(map[string]bool)
+	}
+	c.seen[key] = true
+	return true
 }
 
 func newStatsTracker(enableDiagnostics bool) *statsTracker {
@@ -771,53 +809,104 @@ func (s *statsTracker) AddAckReceived(topic string, payload []byte) {
 	// must not be recorded as delivered, and a payload that does not decode
 	// is neither: a malformed one must not mark an outstanding command
 	// delivered.
-	rejected, index, err := decodeAckStatusIndex(payload)
-	if err != nil {
+	var ack streaming.Ack
+	if err := proto.Unmarshal(payload, &ack); err != nil {
 		s.AddError(fmt.Errorf("undecodable acknowledgement on %s: %w", topic, err))
 		return
 	}
-	if rejected {
-		s.nacksReceived++
-	} else {
-		s.acksReceived++
-	}
+	rejected := ack.GetStatus() == streaming.Ack_NACK
+	index := ack.GetIndex()
 
 	// Acks now come on topics like "{env}/pass/{passId}/channel/{channelId}/uplink/ack"
 	// We need to map that back to the base topic by removing "/ack" at the end
 	baseTopic := strings.TrimSuffix(topic, "/ack")
 
-	// The station always echoes the sender's command index (numbered from 1),
-	// so an acknowledgement matches a command strictly by index. A NACK for a
-	// payload the station could not decode carries nothing to echo and leaves
-	// index unset; such a rejection matches no particular command. Index 0 is
-	// also the echo of a command whose sender never set the field; this
-	// client numbers from 1, so it matches nothing either. An ACK without a
-	// positive index is a tracked error rather than a silent
-	// first-outstanding fallback, so a station regression is visible.
-	if index <= 0 {
-		if !rejected {
+	// This client numbers commands from 1, so index 0 matches nothing: it is
+	// the echo of an undecodable payload, possibly another client's, and is
+	// not counted. An ACK without an index is a tracked error, so a station
+	// regression is visible.
+	if index == 0 {
+		if rejected {
+			vlogf("[Acks] a command on %s could not be decoded by the station: %s", baseTopic, ack.GetReason())
+		} else {
+			s.acksReceived++
 			s.AddError(fmt.Errorf(
-				"acknowledgement without a command index on %s: the station must echo the index of the command it accepts", topic))
+				"acknowledgement without a command index on %s: the station must echo the index of the command it accepts",
+				topic,
+			))
 		}
 		return
 	}
-	// An indexed ack that matches no outstanding command is left silent on
-	// purpose: another observer of the same channel may acknowledge the same
-	// commands, so duplicate indexed acks are normal.
-	for _, cmd := range s.sentCommands {
-		if cmd.topic != baseTopic || cmd.acked || cmd.rejected {
-			continue
-		}
-		if uint64(cmd.index) != uint64(index) {
-			continue
-		}
-		if rejected {
-			cmd.rejected = true
-		} else {
-			cmd.acked = true
-		}
-		break
+	// Other clients commanding the same channel share the ack topic; only
+	// replies to this client's commands count.
+	cmd := s.findSentCommand(baseTopic, ack.GetAckedMessageId(), ack.GetStreamId(), index)
+	if cmd == nil || !cmd.firstSighting(payload) {
+		return
 	}
+	// The station keeps no record of a command it could not hold, so the
+	// operator may send it again unchanged, under the same index.
+	if rejected && ack.GetReasonCode() == commandseq.ReasonHoldBufferFull {
+		vlogf("[Uplink] the ground station is holding too many commands on %s; command #%d was not recorded "+
+			"there and can be sent again unchanged", baseTopic, index)
+	}
+	if rejected {
+		s.nacksReceived++
+		if ack.GetReasonCode() == commandseq.ReasonArrivedLate {
+			s.lateNacks++
+		}
+	} else {
+		s.acksReceived++
+	}
+	// The station kept no record of a command it could not hold, so an ACK
+	// for the same message sent again unchanged settles it.
+	heldFull := cmd.rejected && cmd.nackReasonCode == commandseq.ReasonHoldBufferFull && !rejected
+	if cmd.acked || (cmd.rejected && !heldFull) {
+		return
+	}
+	cmd.rejected, cmd.nackReason, cmd.nackReasonCode = false, "", ""
+	cmd.expectedFinalStage = ack.GetExpectedFinalStage()
+	outcome, reason := "acknowledged", ""
+	if rejected {
+		cmd.rejected = true
+		cmd.nackReason = ack.GetReason()
+		cmd.nackReasonCode = ack.GetReasonCode()
+		outcome = "rejected"
+		if cmd.nackReason != "" {
+			reason = ": " + cmd.nackReason
+		}
+	} else {
+		cmd.acked = true
+	}
+	closeSignal(cmd.answered)
+	if rejected || cmd.expectedFinalStage == streaming.CommandStage_COMMAND_STAGE_UNSPECIFIED {
+		closeSignal(cmd.finished)
+	}
+	// One verbose line per resolved ack, carrying the echoed index, so an
+	// observer can measure the client-side round trip of each command.
+	vlogf("[Acks] command #%d %s on %s%s", index, outcome, baseTopic, reason)
+	// And one line the operator always sees.
+	uiInfof("[Ack] %s #%d %s by the ground station%s", commandKindOfTopic(baseTopic), index, outcome, reason)
+}
+
+// findSentCommand returns the command a reply on baseTopic answers: by
+// message ID when the reply carries one, else by index. Callers hold s.mu.
+func (s *statsTracker) findSentCommand(baseTopic, messageID, streamID string, index uint64) *sentCommand {
+	for _, cmd := range s.sentCommands {
+		// Other clients' commands share the topic; their replies are not ours.
+		if cmd.topic != baseTopic || (streamID != "" && streamID != cmd.streamID) {
+			continue
+		}
+		if messageID != "" {
+			if cmd.messageID == messageID {
+				return cmd
+			}
+			continue
+		}
+		if uint64(cmd.index) == index {
+			return cmd
+		}
+	}
+	return nil
 }
 
 func (s *statsTracker) AddReceivedMessage(topic, msgType string, index int, channelID string) {
@@ -833,17 +922,41 @@ func (s *statsTracker) AddReceivedMessage(topic, msgType string, index int, chan
 	})
 }
 
-func (s *statsTracker) AddSentCommand(topic, cmdType string, index uint32) {
+// AddSentCommand records a published command message and returns its record.
+func (s *statsTracker) AddSentCommand(topic, cmdType string, msg *streaming.ToStarPassMessage) *sentCommand {
 	s.markActivity()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.sentCommands = append(s.sentCommands, &sentCommand{
+	cmd := &sentCommand{
 		topic:     topic,
 		cmdType:   cmdType,
-		index:     index,
+		index:     msg.GetIndex(),
+		messageID: msg.GetMessageId(),
+		streamID:  msg.GetStreamId(),
 		timestamp: time.Now().UnixNano(),
-		acked:     false,
-	})
+		answered:  make(chan struct{}),
+		finished:  make(chan struct{}),
+	}
+	s.sentCommands = append(s.sentCommands, cmd)
+	return cmd
+}
+
+// commandSnapshot returns a copy of cmd that is safe to read without s.mu.
+func (s *statsTracker) commandSnapshot(cmd *sentCommand) sentCommand {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return *cmd
+}
+
+// commandSnapshots returns a copy of every sent command, in send order.
+func (s *statsTracker) commandSnapshots() []sentCommand {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]sentCommand, len(s.sentCommands))
+	for i, cmd := range s.sentCommands {
+		out[i] = *cmd
+	}
+	return out
 }
 
 // SentCommandCounts returns how many satellite commands ("sat", cmdType
@@ -885,16 +998,6 @@ func (s *statsTracker) GetUnackedSentCommands() []*sentCommand {
 		}
 	}
 	return unacked
-}
-
-// GetAllSentCommands returns all sent commands (for diagnostics)
-func (s *statsTracker) GetAllSentCommands() []*sentCommand {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	// Return a copy to avoid race conditions
-	cmds := make([]*sentCommand, len(s.sentCommands))
-	copy(cmds, s.sentCommands)
-	return cmds
 }
 
 func (s *statsTracker) MarkReceivedMessageAcked(topic string) {
@@ -1015,9 +1118,13 @@ func (s *statsTracker) LogStats() {
 	_ = channelIDs
 
 	satCmds, gsCmds := s.SentCommandCounts()
+	uplinkSeg := fmt.Sprintf("%s %d sat, %d gs", kindUplink.tag(), satCmds, gsCmds)
+	if delivery := countDeliveries(s.commandSnapshots()).String(); delivery != "" {
+		uplinkSeg += ", " + delivery
+	}
 	ackSeg := fmt.Sprintf("%s %d sent, %d received", kindAck.tag(), s.acksSent, s.acksReceived)
-	if s.nacksReceived > 0 {
-		ackSeg += fmt.Sprintf(", %d rejected", s.nacksReceived)
+	if n := s.nacksReceived - s.lateNacks; n > 0 {
+		ackSeg += fmt.Sprintf(", %d rejected", n)
 	}
 	segs := []string{
 		fmt.Sprintf("%s %s msgs, %s across %s ch, %s",
@@ -1029,7 +1136,7 @@ func (s *statsTracker) LogStats() {
 		fmt.Sprintf("%s %d", kindMonitoring.tag(), monitoringCount),
 		fmt.Sprintf("%s %d", kindEvent.tag(), eventCount),
 		fmt.Sprintf("%s %d", kindConfig.tag(), configCount),
-		fmt.Sprintf("%s %d sat, %d gs", kindUplink.tag(), satCmds, gsCmds),
+		uplinkSeg,
 		ackSeg,
 	}
 	summary := paint(ui.dim, "elapsed "+elapsed) + "   " + joinSegs(segs)
@@ -1237,4 +1344,12 @@ func humanReadableNanoSeconds(nanos int64) string {
 	}
 	nanosFloat /= 60.0 // hours
 	return fmt.Sprintf("%.1f h", nanosFloat)
+}
+
+// commandKindOfTopic names the kind of command a publish topic carries.
+func commandKindOfTopic(topic string) string {
+	if strings.HasSuffix(topic, "/config_request") {
+		return "config request"
+	}
+	return "satellite command"
 }

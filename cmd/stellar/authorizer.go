@@ -153,9 +153,11 @@ type StreamConfig struct {
 
 // CommandConfig contains publish topic and ack subscription for commands
 type CommandConfig struct {
-	PublishTopic string `json:"publishTopic"` // MQTT topic to publish commands to
-	AckTopic     string `json:"ackTopic"`     // MQTT topic to subscribe for acks
-	S3AckPrefix  string `json:"s3AckPrefix"`  // S3 prefix for ack backups
+	PublishTopic   string `json:"publishTopic"`   // MQTT topic to publish commands to
+	AckTopic       string `json:"ackTopic"`       // MQTT topic to subscribe for acks
+	S3AckPrefix    string `json:"s3AckPrefix"`    // S3 prefix for ack backups
+	StatusTopic    string `json:"statusTopic"`    // MQTT topic to subscribe for delivery statuses
+	S3StatusPrefix string `json:"s3StatusPrefix"` // S3 prefix for status backups
 }
 
 // AuthorizerRequest contains the parameters sent to the authorizer API
@@ -191,6 +193,46 @@ type AuthorizerRequest struct {
 	// if another client already holds commanding authority on a requested channel
 	// (the one-commanding-authority-per-channel rule). Set from --override-commanding-lock.
 	OverrideCommandingLock bool `json:"overrideCommandingLock,omitempty"`
+}
+
+// authorizerErrorStreamLimitReached is the authorizer's error code when the pass
+// already has as many open streams as its execution configuration allows.
+const authorizerErrorStreamLimitReached = "stream_limit_reached"
+
+// authorizerErrorStreamRevoked is the authorizer's error code when the stream
+// was revoked by an operator or by another client taking over commanding.
+const authorizerErrorStreamRevoked = "stream_revoked"
+
+// authorizerErrorReplayWindowClosed is the authorizer's error code when the
+// pass is past its telemetry retention, so its data is deleted or about to be
+// and it can no longer be replayed.
+const authorizerErrorReplayWindowClosed = "replay_window_closed"
+
+// authorizerErrorConnectionWindowNotOpen is the authorizer's error code when
+// the pass's AOS is further away than its pre-AOS connection window, so it
+// does not accept connections yet. The message says when it opens.
+const authorizerErrorConnectionWindowNotOpen = "connection_window_not_open"
+
+// authorizerError is a 4xx refusal from the authorizer, carrying its error code
+// so callers can explain specific refusals (see authorizerErrorStreamLimitReached).
+type authorizerError struct {
+	Status  int    `json:"-"`
+	Code    string `json:"error"`
+	Message string `json:"message"`
+}
+
+func (e *authorizerError) Error() string {
+	detail := e.Message
+	if detail == "" {
+		detail = e.Code
+	}
+	return fmt.Sprintf("%s (status %d)", detail, e.Status)
+}
+
+// isAuthorizerError reports whether err is an authorizer refusal with the given code.
+func isAuthorizerError(err error, code string) bool {
+	var ae *authorizerError
+	return errors.As(err, &ae) && ae.Code == code
 }
 
 // fetchAuthorizerCredentials calls the authorizer API to get temporary AWS credentials
@@ -309,18 +351,11 @@ func fetchAuthorizerCredentials(
 			body, _ := io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
 
-			var errorResp struct {
-				Error   string `json:"error"`
-				Message string `json:"message"`
-			}
-			if err := json.Unmarshal(body, &errorResp); err == nil {
-				detail := errorResp.Message
-				if detail == "" {
-					detail = errorResp.Error
-				}
-				if detail != "" {
-					return nil, fmt.Errorf("%s (status %d)", detail, resp.StatusCode)
-				}
+			var errorResp authorizerError
+			decodeErr := json.Unmarshal(body, &errorResp)
+			if decodeErr == nil && (errorResp.Code != "" || errorResp.Message != "") {
+				errorResp.Status = resp.StatusCode
+				return nil, &errorResp
 			}
 			return nil, fmt.Errorf("the request was rejected (status %d): %s", resp.StatusCode, string(body))
 		}

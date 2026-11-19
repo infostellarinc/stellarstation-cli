@@ -1,152 +1,119 @@
 package main
 
 import (
-	"github.com/google/uuid"
-
-	"context"
 	"errors"
 	"fmt"
 	"log"
 
+	"github.com/benbjohnson/clock"
 	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/google/uuid"
 	"google.golang.org/protobuf/proto"
 
 	streaming "github.com/infostellarinc/stellarstation-cli/gen/pb/stellarstation/satellitestreamer"
 	v1 "github.com/infostellarinc/stellarstation-cli/gen/pb/stellarstation/starpass/v1"
 )
 
-// publishCommand publishes a command message to the specified MQTT topic and waits for acknowledgment.
-//
-// Parameters:
-//   - client: The MQTT client to use for publishing
-//   - topic: The MQTT topic to publish to
-//   - qos: The MQTT QoS level (0, 1, or 2)
-//   - msg: The protobuf message to publish
-//   - stats: Optional stats tracker for tracking sent commands
-//   - cmdType: The command type string (e.g., "uplink", "config_request")
-//   - index: The command index
-//
-// Returns:
-//   - An error if publishing fails or times out
-func publishCommand(
-	client mqtt.Client,
-	topic string,
-	qos byte,
-	msg proto.Message,
-	stats interface {
-		AddSentCommand(topic, cmdType string, index uint32)
-	},
-	cmdType string,
-	index uint32,
-) error {
+// commandPublisher publishes command messages on one MQTT connection. Each
+// command is published once: the client never retries on its own, since
+// retries during a pass only add to the congestion that lost the first copy.
+// An unanswered command is reported as such (see awaitCommands).
+type commandPublisher struct {
+	client mqtt.Client
+	qos    byte
+	stats  *statsTracker
+	window passWindow
+	clock  clock.Clock
+}
+
+func newCommandPublisher(client mqtt.Client, qos byte, stats *statsTracker, window passWindow) *commandPublisher {
+	if stats == nil {
+		stats = newStatsTracker(false)
+	}
+	return &commandPublisher{
+		client: client,
+		qos:    qos,
+		stats:  stats,
+		window: window,
+		clock:  clock.New(),
+	}
+}
+
+// publishCommand publishes msg to topic once and records it.
+func (p *commandPublisher) publishCommand(
+	topic, cmdType string, msg *streaming.ToStarPassMessage,
+) (*sentCommand, error) {
 	wire, err := proto.Marshal(msg)
 	if err != nil {
-		return fmt.Errorf("marshal command message: %w", err)
+		return nil, fmt.Errorf("marshal command message: %w", err)
 	}
 	// Backstop for the per-command check: the broker rejects an oversized
 	// publish, so refuse it rather than report a send that never arrived.
 	if len(wire) > mqttMaxPayloadBytes {
-		return fmt.Errorf(
+		return nil, fmt.Errorf(
 			"message is %d bytes, over the %d byte limit for a single message",
 			len(wire), mqttMaxPayloadBytes,
 		)
 	}
+	// Recorded before the publish so an ack that beats the publish
+	// confirmation still finds its command.
+	cmd := p.stats.AddSentCommand(topic, cmdType, msg)
+	if err := p.publishWire(topic, wire); err != nil {
+		// The broker may still deliver it, so the index stays used: a copy
+		// under the same index would be refused as reused, and a new command
+		// takes the next index.
+		return cmd, fmt.Errorf("command #%d was not confirmed by the broker and may still arrive: %w", cmd.index, err)
+	}
+	log.Printf("Published command to topic=%s wire=%dB", topic, len(wire))
+	return cmd, nil
+}
 
-	token := client.Publish(topic, qos, false, wire)
+func (p *commandPublisher) publishWire(topic string, wire []byte) error {
+	token := p.client.Publish(topic, p.qos, false, wire)
 	if !token.WaitTimeout(publishCommandTimeout) {
 		return errors.New("publish command timeout")
 	}
 	if token.Error() != nil {
 		return fmt.Errorf("publish command: %w", token.Error())
 	}
-
-	log.Printf("Published command to topic=%s wire=%dB", topic, len(wire))
-	if stats != nil {
-		stats.AddSentCommand(topic, cmdType, index)
-	}
 	return nil
 }
 
-// PublishSatCommand publishes a satellite command message to MQTT.
-//
-// The topic must be provided from authorizer credentials - the CLI does not construct topics.
-//
-// Parameters:
-//   - ctx: Context for cancellation (unused but kept for API compatibility)
-//   - client: The MQTT client to use for publishing
-//   - topic: The MQTT topic from authorizer (cfg.AuthorizerCreds.Streams.Uplink.PublishTopic)
-//   - streamID: The stream ID for the command
-//   - planID: The plan ID for the command
-//   - index: The command index
-//   - commands: Array of command byte arrays to send
-//   - qos: The MQTT QoS level
-//   - stats: Stats tracker for tracking sent commands
-//
-// Returns:
-//   - An error if the client is not connected, the commands are too large to
-//     publish, or publishing fails
+// PublishSatCommand publishes a satellite command message. The topic must come
+// from the authorizer credentials; the CLI does not construct topics.
 func PublishSatCommand(
-	_ context.Context, // ctx - unused but kept for API compatibility
-	client mqtt.Client,
-	topic string, // Topic from authorizer (cfg.AuthorizerCreds.Streams.Uplink.PublishTopic)
-	streamID string,
-	planID string,
+	p *commandPublisher,
+	topic, streamID, planID string,
 	index uint32,
 	commands [][]byte,
-	qos byte,
-	stats *statsTracker,
-) error {
-	if !client.IsConnected() {
-		return errors.New("MQTT client not connected")
+) (*sentCommand, error) {
+	if !p.client.IsConnected() {
+		return nil, errors.New("MQTT client not connected")
 	}
 	if err := validateCommandSize(commands); err != nil {
-		return err
+		return nil, err
 	}
-
-	toStarPassMsg := &streaming.ToStarPassMessage{
+	return p.publishCommand(topic, cmdTypeUplink, &streaming.ToStarPassMessage{
 		MessageId: uuid.NewString(),
 		StreamId:  streamID,
 		PassId:    planID,
 		Index:     index,
 		Command:   commands,
-	}
-
-	return publishCommand(client, topic, qos, toStarPassMsg, stats, "uplink", index)
+	})
 }
 
-// PublishGsConfig publishes a ground station configuration request to MQTT.
-//
-// The topic must be provided from authorizer credentials - the CLI does not construct topics.
-//
-// Parameters:
-//   - ctx: Context for cancellation (unused but kept for API compatibility)
-//   - client: The MQTT client to use for publishing
-//   - topic: The MQTT topic from authorizer (cfg.AuthorizerCreds.Streams.ConfigRequest.PublishTopic)
-//   - streamID: The stream ID for the configuration
-//   - planID: The plan ID for the configuration
-//   - index: The configuration index
-//   - configRequest: The ground station configuration request protobuf message
-//   - qos: The MQTT QoS level
-//   - stats: Stats tracker for tracking sent commands
-//
-// Returns:
-//   - An error if the client is not connected or publishing fails
+// PublishGsConfig publishes a ground station configuration request. The topic
+// must come from the authorizer credentials; the CLI does not construct topics.
 func PublishGsConfig(
-	_ context.Context, // ctx - unused but kept for API compatibility
-	client mqtt.Client,
-	topic string, // Topic from authorizer (cfg.AuthorizerCreds.Streams.ConfigRequest.PublishTopic)
-	streamID string,
-	planID string,
+	p *commandPublisher,
+	topic, streamID, planID string,
 	index uint32,
 	configRequest *v1.GroundStationConfigurationRequest,
-	qos byte,
-	stats *statsTracker,
-) error {
-	if !client.IsConnected() {
-		return errors.New("MQTT client not connected")
+) (*sentCommand, error) {
+	if !p.client.IsConnected() {
+		return nil, errors.New("MQTT client not connected")
 	}
-
-	toStarPassMsg := &streaming.ToStarPassMessage{
+	return p.publishCommand(topic, cmdTypeConfigRequest, &streaming.ToStarPassMessage{
 		MessageId: uuid.NewString(),
 		StreamId:  streamID,
 		PassId:    planID,
@@ -154,7 +121,5 @@ func PublishGsConfig(
 		Message: &streaming.ToStarPassMessage_GroundStationConfigurationRequest{
 			GroundStationConfigurationRequest: configRequest,
 		},
-	}
-
-	return publishCommand(client, topic, qos, toStarPassMsg, stats, "config_request", index)
+	})
 }

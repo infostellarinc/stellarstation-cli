@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -23,6 +24,7 @@ import (
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	streaming "github.com/infostellarinc/stellarstation-cli/gen/pb/stellarstation/satellitestreamer"
 )
@@ -45,12 +47,19 @@ type mqttConnectionConfig struct {
 	// Certificate-based mutual TLS (port 8883). The broker URL is ssl://<endpoint>:8883.
 	// This is the only supported authentication method.
 	tlsCertificate *tls.Certificate
+	// connectionLost is Config.ConnectionLost.
+	connectionLost func() bool
 }
 
 // resolveMQTTClientID appends a random numeric suffix to the authorizer-supplied
 // clientID. The authorizer authorizes client IDs of the form "<clientID>-<suffix>",
 // so the bare clientID would be rejected, and the random suffix also keeps
 // concurrent sessions from colliding on the same connection identity.
+
+// streamClosing is set once this client starts closing its stream, after which
+// a lost MQTT connection is expected rather than an outage.
+var streamClosing atomic.Bool
+
 func resolveMQTTClientID(credsClientID string) string {
 	nBig, err := rand.Int(rand.Reader, big.NewInt(1_000_000_000))
 	if err != nil {
@@ -108,18 +117,38 @@ func collectMQTTTopics(streams StreamsConfig) []string {
 	if streams.Event != nil && streams.Event.MqttTopic != "" {
 		topics = append(topics, streams.Event.MqttTopic)
 	}
-	// Subscribe to command ack topics for all channels
-	for _, uplink := range streams.Uplink {
-		if uplink.AckTopic != "" {
-			topics = append(topics, uplink.AckTopic)
-		}
-	}
-	for _, configReq := range streams.ConfigRequest {
-		if configReq.AckTopic != "" {
-			topics = append(topics, configReq.AckTopic)
-		}
-	}
+	topics = append(topics, commandReplyTopics(streams)...)
 	return collapseChannelWildcards(topics)
+}
+
+// commandReplyTopics returns the ack and status topics of every command
+// channel, uplink first.
+func commandReplyTopics(streams StreamsConfig) []string {
+	var topics []string
+	for _, cmds := range [][]CommandConfig{streams.Uplink, streams.ConfigRequest} {
+		for _, c := range cmds {
+			for _, t := range []string{c.AckTopic, c.StatusTopic} {
+				if t != "" {
+					topics = append(topics, t)
+				}
+			}
+		}
+	}
+	return topics
+}
+
+// routeCommandReply hands a command ack or status to stats and reports
+// whether topic carried one.
+func routeCommandReply(stats *statsTracker, topic string, payload []byte) bool {
+	switch {
+	case isCommandStatusTopic(topic):
+		stats.AddStatusBatch(topic, payload)
+	case strings.Contains(topic, "/ack"):
+		stats.AddAckReceived(topic, payload)
+	default:
+		return false
+	}
+	return true
 }
 
 // collapseChannelWildcards rewrites the per-channel segment of each topic to the
@@ -175,7 +204,7 @@ func channelWildcard(topic string) string {
 // is only valid for the duration of the pass (it is never stored).
 func buildMQTTConnectionConfigFromCert(
 	_ context.Context,
-	_ Config,
+	cfg Config,
 	creds *AuthorizerCredentials,
 ) (*mqttConnectionConfig, error) {
 	// Parse the PEM certificate and private key returned by the authorizer.
@@ -223,6 +252,7 @@ func buildMQTTConnectionConfigFromCert(
 		topics:         topics,
 		clientID:       mqttClientID,
 		tlsCertificate: &cert,
+		connectionLost: cfg.ConnectionLost,
 	}, nil
 }
 
@@ -297,6 +327,15 @@ func buildMQTTClientOptions(
 		// backfill); a gap in received acks with no visible cause is worse than
 		// one extra line of output. The deeper technical detail (raw error type,
 		// TLS diagnosis) stays verbose-only.
+		if connCfg.connectionLost != nil && connCfg.connectionLost() {
+			// The stream was revoked: the operator has been told, and the
+			// session is stopping.
+			return
+		}
+		if streamClosing.Load() {
+			// This client closed the stream itself.
+			return
+		}
 		if err != nil {
 			log.Printf("MQTT connection lost (%v); reconnecting, command acks or telemetry received during the outage may be missing", err)
 		} else {
@@ -651,6 +690,33 @@ func extractMessagePayload(msgProto *streaming.FromStarPassMessage) []byte {
 		}
 	}
 	return payload
+}
+
+// telemetrySendTimestamp returns the time the station recorded for the
+// message's first telemetry frame, or the zero time when the station did not
+// stamp one. It is used only to record a chunk's send time for one-way latency
+// measurement (fetchResult.SendTimestamp); telemetry acks report this side's
+// receipt time instead, so this value never feeds an ack.
+func telemetrySendTimestamp(msgProto *streaming.FromStarPassMessage) time.Time {
+	stm := msgProto.GetSendTelemetryMessage()
+	if stm == nil {
+		return time.Time{}
+	}
+	for _, t := range stm.GetTelemetry() {
+		for _, ts := range []*timestamppb.Timestamp{
+			t.GetTimeFirstByteReceived(),
+			t.GetTimeLastByteReceived(),
+		} {
+			// A present-but-default timestamp is what an unset proto field
+			// unmarshals to. Taking it would report the 1970 epoch as the
+			// station's send time and put a 56-year outlier into the latency
+			// statistics, which no amount of averaging recovers from.
+			if ts.IsValid() && ts.AsTime().Unix() != 0 {
+				return ts.AsTime()
+			}
+		}
+	}
+	return time.Time{}
 }
 
 // extractMessageFraming extracts the framing type from a telemetry message.
@@ -1167,7 +1233,11 @@ func handleTelemetryMessage(
 		framingType = framing
 	}
 
-	// Extract timestamp from telemetry message for accurate bitrate calculation
+	// The station's own send time, kept only for the chunk's sidecar file, and
+	// zero when the station did not stamp one. It is deliberately not used for
+	// the ack below, whose received_at is this side's receipt time.
+	sendTimestamp := telemetrySendTimestamp(msgProto)
+
 	// Build proto ack for telemetry. Ack.received_at is receipt time (this
 	// side's clock at handling), not the payload's capture time.
 	ackPayload, err := buildTelemetryAck(
@@ -1197,13 +1267,14 @@ func handleTelemetryMessage(
 	telemetryChannelID := channelID + "/downlink"
 
 	route(fetchResult{
-		Index:     index,
-		ChannelID: telemetryChannelID,
-		Framing:   framing,
-		Data:      payload,
-		Metadata:  metadata,
-		Err:       nil,
-		Source:    SourceMQTT,
+		Index:         index,
+		ChannelID:     telemetryChannelID,
+		Framing:       framing,
+		Data:          payload,
+		Metadata:      metadata,
+		Err:           nil,
+		Source:        SourceMQTT,
+		SendTimestamp: sendTimestamp,
 	})
 }
 
@@ -1218,8 +1289,7 @@ func newMQTTMessageHandler(
 	ackSender *ackSender,
 ) mqtt.MessageHandler {
 	return func(client mqtt.Client, msg mqtt.Message) {
-		if strings.Contains(msg.Topic(), "/ack") {
-			stats.AddAckReceived(msg.Topic(), msg.Payload())
+		if routeCommandReply(stats, msg.Topic(), msg.Payload()) {
 			return
 		}
 
@@ -1796,6 +1866,22 @@ func expectedTelemetryKeys(cfg Config) map[channelFramingKey]bool {
 	return expected
 }
 
+// lowRateTelemetryChannelCount is how many channels deliver telemetry over
+// MQTT: the low-rate downlink channels the authorizer described, or every
+// configured channel when it described none (older authorizers).
+func lowRateTelemetryChannelCount(cfg Config) int {
+	if cfg.AuthorizerCreds == nil || len(cfg.AuthorizerCreds.Channels) == 0 {
+		return len(cfg.ChannelIDs)
+	}
+	n := 0
+	for _, ch := range cfg.AuthorizerCreds.Channels {
+		if ch.Direction != directionUplink && ch.RateClass != rateClassHighRate {
+			n++
+		}
+	}
+	return n
+}
+
 // mqttAllSequencesFinished reports whether every telemetry sequence the pass
 // will produce has finished.
 //
@@ -1866,6 +1952,7 @@ func newMQTTInOrderWorker(
 					stats,
 					cfg.WriteInOrder,
 					cfg,
+					pr.SendTimestamp,
 				); err != nil {
 					stats.AddError(
 						fmt.Errorf("write index %d (channel %s): %w", pr.Index, pr.ChannelID, err),
@@ -1891,7 +1978,7 @@ func newMQTTInOrderWorker(
 					done = true
 					pending = nil // release; further sends are drained and discarded below
 					allDone.markDone(key)
-					if mqttAllSequencesFinished(allDone, activeKeys, expectedKeys, len(cfg.ChannelIDs)) {
+					if mqttAllSequencesFinished(allDone, activeKeys, expectedKeys, lowRateTelemetryChannelCount(cfg)) {
 						finishedOnce.Do(func() {
 							if cfg.EnableAutoClose {
 								uiOKf("All channels have finished. Stopping.")
@@ -1992,7 +2079,7 @@ func newMQTTRelaxedWorker(
 
 			if allReceived {
 				allDone.markDone(key)
-				if mqttAllSequencesFinished(allDone, activeKeys, expectedKeys, len(cfg.ChannelIDs)) {
+				if mqttAllSequencesFinished(allDone, activeKeys, expectedKeys, lowRateTelemetryChannelCount(cfg)) {
 					finishedOnce.Do(func() {
 						log.Printf(
 							"Stream auto-close: all channels completed with all messages received, exiting...",
@@ -2016,7 +2103,7 @@ func newMQTTRelaxedWorker(
 					}
 					if allReceivedNow {
 						allDone.markDone(key)
-						if mqttAllSequencesFinished(allDone, activeKeys, expectedKeys, len(cfg.ChannelIDs)) {
+						if mqttAllSequencesFinished(allDone, activeKeys, expectedKeys, lowRateTelemetryChannelCount(cfg)) {
 							finishedOnce.Do(func() {
 								log.Printf("Stream auto-close: all channels completed (after grace period), exiting...")
 								exitAfterTeardown()
@@ -2079,6 +2166,7 @@ func newMQTTRelaxedWorker(
 					stats,
 					cfg.WriteInOrder,
 					cfg,
+					res.SendTimestamp,
 				); err != nil {
 					stats.AddError(
 						fmt.Errorf("write index %d (channel %s): %w", res.Index, res.ChannelID, err),
@@ -2527,6 +2615,10 @@ func processS3TelemetryObject(
 	payload := extractMessagePayload(msgProto)
 	metadata := extractMessageMetadata(msgProto, nil)
 
+	// The station's own send time, kept only for the chunk's sidecar file (see
+	// fetchResult.SendTimestamp), and zero when the station did not stamp one.
+	sendTimestamp := telemetrySendTimestamp(msgProto)
+
 	// Send ack for S3 message via MQTT
 	if client != nil && ackSender != nil && client.IsConnected() {
 		// Build topic from S3 key (approximate - we need the actual MQTT topic)
@@ -2560,13 +2652,14 @@ func processS3TelemetryObject(
 	// channelID from extractChannelIDFromLowRateStream already includes "/downlink" for telemetry
 	// Use it directly to match the format
 	route(fetchResult{
-		Index:     index,
-		ChannelID: channelID, // Already in format "channelID/downlink" from extractChannelIDFromLowRateStream
-		Framing:   framing,
-		Data:      payload,
-		Metadata:  metadata,
-		Err:       nil,
-		Source:    SourceS3,
+		Index:         index,
+		ChannelID:     channelID, // Already in format "channelID/downlink" from extractChannelIDFromLowRateStream
+		Framing:       framing,
+		Data:          payload,
+		Metadata:      metadata,
+		Err:           nil,
+		Source:        SourceS3,
+		SendTimestamp: sendTimestamp,
 	})
 }
 

@@ -5,8 +5,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/infostellarinc/stellarstation-cli/internal/auth"
-
 	"github.com/aws/aws-sdk-go-v2/aws"
 )
 
@@ -57,13 +55,8 @@ func (p *refreshingCredentialsProvider) Retrieve(_ context.Context) (aws.Credent
 // new credentials on the next request (via refreshingCredentialsProvider.Retrieve) and
 // the MQTT client uses a fresh IoT certificate on its next hard reconnect cycle.
 // The refresher stops when ctx is cancelled (i.e. when the CLI shuts down).
-func runCredentialRefresher(
-	ctx context.Context,
-	store *credentialStore,
-	apiURL string,
-	tokenSource auth.TokenSource,
-	authReq AuthorizerRequest,
-) {
+func runCredentialRefresher(ctx context.Context, watch *streamRevocationWatch) {
+	store := watch.store
 	for {
 		current := store.load()
 		untilExpiry := time.Until(current.Expiration)
@@ -85,9 +78,14 @@ func runCredentialRefresher(
 		vlogf("credential refresher: refreshing credentials (expiry was %s)",
 			current.Expiration.Format(time.RFC3339))
 
-		newCreds, err := fetchAuthorizerCredentials(ctx, apiURL, tokenSource, authReq)
+		newCreds, err := watch.refresh(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
+				return
+			}
+			if watch.isRevoked() {
+				// Retrying cannot help: a revoked stream is never authorized
+				// again. The watch has told the operator.
 				return
 			}
 			vlogf(
@@ -103,7 +101,6 @@ func runCredentialRefresher(
 			continue
 		}
 
-		store.store(newCreds)
 		vlogf("credential refresher: credentials refreshed, new expiry %s",
 			newCreds.Expiration.Format(time.RFC3339))
 	}

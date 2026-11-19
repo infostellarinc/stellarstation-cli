@@ -4,7 +4,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,7 +17,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// normalizeOrbitDataCreateSource maps CLI-friendly values to OrbitDataCreateRequest.source enums.
+// normalizeOrbitDataCreateSource maps CLI-friendly values to CreateOrbitDataRequest.source enums.
 func normalizeOrbitDataCreateSource(s string) string {
 	key := strings.ToLower(strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(s, "_", "-"), " ", "")))
 	switch key {
@@ -31,7 +34,7 @@ func normalizeOrbitDataCreateSource(s string) string {
 	}
 }
 
-// normalizeOrbitalDataParameterSource maps CLI-friendly values to OrbitParametersUpdateRequest.orbital_data_source enums.
+// normalizeOrbitalDataParameterSource maps CLI-friendly values to UpdateOrbitParametersRequest.orbital_data_source enums.
 func normalizeOrbitalDataParameterSource(s string) string {
 	key := strings.ToLower(strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(s, "_", "-"), " ", "")))
 	switch key {
@@ -74,6 +77,43 @@ var orbitDataColumns = []printer.Column{ //nolint:gochecknoglobals
 	{Header: "LINE2", Extract: func(r interface{}) string {
 		return orbitalDataString(r.(*apiclient.OrbitData), "line2") //nolint:errcheck
 	}},
+	{Header: "CONVERTED_FROM", Extract: func(r interface{}) string {
+		return conversionSummary(r.(*apiclient.OrbitData).Conversion) //nolint:errcheck
+	}},
+}
+
+// conversionSummary describes how a TLE was converted, e.g. "OEM (fit 0.55 km
+// RMS, 1.28 km max)", or "" for an uploaded TLE.
+func conversionSummary(c *apiclient.OrbitConversion) string {
+	if c == nil {
+		return ""
+	}
+	if c.Fit == nil {
+		return c.From
+	}
+	return fmt.Sprintf("%s (fit %.2f km RMS, %.2f km max)", c.From, c.Fit.RmsKm, c.Fit.MaxKm)
+}
+
+// orbitValidationColumns render a dry run of add-orbit-data.
+var orbitValidationColumns = []printer.Column{ //nolint:gochecknoglobals
+	{Header: "VALID", Extract: func(r interface{}) string {
+		return strconv.FormatBool(r.(*apiclient.OrbitValidationResult).Valid) //nolint:errcheck
+	}},
+	{Header: "LINE1", Extract: func(r interface{}) string {
+		if tle := r.(*apiclient.OrbitValidationResult).Tle; tle != nil { //nolint:errcheck
+			return tle.Line1
+		}
+		return ""
+	}},
+	{Header: "LINE2", Extract: func(r interface{}) string {
+		if tle := r.(*apiclient.OrbitValidationResult).Tle; tle != nil { //nolint:errcheck
+			return tle.Line2
+		}
+		return ""
+	}},
+	{Header: "CONVERTED_FROM", Extract: func(r interface{}) string {
+		return conversionSummary(r.(*apiclient.OrbitValidationResult).Conversion) //nolint:errcheck
+	}},
 }
 
 // orbitalDataString returns a string-valued field from the free-form
@@ -107,7 +147,7 @@ var orbitParamsColumns = []printer.Column{ //nolint:gochecknoglobals
 	},
 	{
 		Header:  "ORBIT_TYPE",
-		Extract: func(r interface{}) string { return r.(*apiclient.OrbitParameters).OrbitType }, //nolint:errcheck
+		Extract: func(r interface{}) string { return effectiveOrbitType(r.(*apiclient.OrbitParameters)) }, //nolint:errcheck
 	},
 }
 
@@ -147,29 +187,45 @@ func runGetTLE(cmd *cobra.Command, _ []string) error {
 	return renderOne(cmd, format, orbitDataColumns, data, "")
 }
 
-// parseOrbitalDataInput parses orbital data supplied inline (--data) or from a
-// file (--data-file). JSON is accepted for either type: a TLE as
-// {"line1": "...", "line2": "..."} or an OMM as its standard mean-element field
-// names. A raw two-line element set (non-JSON) is accepted only for TLE; OMM
-// must be JSON.
+// orbitDataTypes are the --data-type values add-orbit-data accepts.
+var orbitDataTypes = []string{"TLE", "OMM", "KEPLERIAN", "OEM"} //nolint:gochecknoglobals
+
+// parseOrbitalDataInput turns orbit data supplied inline (--data) or from a file
+// (--data-file) into the API's orbital_data object:
+//
+//	TLE        two-line text (a title line is allowed) or {"line1": ..., "line2": ...}
+//	OMM        a JSON object of OMM fields, or a whole OMM document (KVN, XML, or the
+//	           JSON array CelesTrak and Space-Track serve), sent as {"omm": <text>}
+//	KEPLERIAN  a JSON object of the elements
+//	OEM        a CCSDS OEM document (KVN or XML), sent as {"oem": <text>}
 func parseOrbitalDataInput(raw, dataType string) (map[string]interface{}, error) {
 	if strings.TrimSpace(raw) == "" {
 		return nil, errors.New("the orbit data is empty")
 	}
-	if strings.HasPrefix(strings.TrimSpace(raw), "{") {
-		var m map[string]interface{}
-		if err := json.Unmarshal([]byte(raw), &m); err != nil {
-			return nil, fmt.Errorf("that JSON could not be read: %w", err)
+	isObject := strings.HasPrefix(strings.TrimSpace(raw), "{")
+	switch dataType {
+	case "OEM":
+		return map[string]interface{}{"oem": raw}, nil
+	case "OMM":
+		if !isObject {
+			return map[string]interface{}{"omm": raw}, nil
 		}
-		return m, nil
+	case "KEPLERIAN":
+		if !isObject {
+			return nil, errors.New(`the Keplerian elements must be JSON, e.g. {"epoch": "2026-11-12T00:00:00Z", ` +
+				`"semi_major_axis_km": 6878.137, "eccentricity": 0.001, "inclination_deg": 97.4, ` +
+				`"raan_deg": 120, "arg_of_perigee_deg": 90, "true_anomaly_deg": 0, "frame": "EME2000"}`)
+		}
+	case "TLE":
+		if !isObject {
+			return parseTLEText(raw)
+		}
 	}
-	if dataType == "OMM" {
-		return nil, errors.New(`OMM must be provided as JSON (its mean-element fields, e.g. ` +
-			`{"MEAN_MOTION": 15.5, "ECCENTRICITY": 0.0007, "INCLINATION": 51.6, ` +
-			`"RA_OF_ASC_NODE": 247.5, "ARG_OF_PERICENTER": 130.5, "MEAN_ANOMALY": 325.0, ` +
-			`"EPOCH": "2026-05-08T12:00:00Z"}); pass it with --data-file`)
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		return nil, fmt.Errorf("that JSON could not be read: %w", err)
 	}
-	return parseTLEText(raw)
+	return m, nil
 }
 
 // parseTLEText parses the standard two-line element set text format into the
@@ -239,6 +295,10 @@ var orbitHistoryColumns = []printer.Column{ //nolint:gochecknoglobals
 		Extract: func(r interface{}) string { return r.(*apiclient.OrbitHistoryItem).ID }, //nolint:errcheck
 	},
 	{
+		Header:  "ACTIVATION_ID",
+		Extract: func(r interface{}) string { return r.(*apiclient.OrbitHistoryItem).ActivationID }, //nolint:errcheck
+	},
+	{
 		Header:  "TYPE",
 		Extract: func(r interface{}) string { return r.(*apiclient.OrbitHistoryItem).OrbitalDataType }, //nolint:errcheck
 	},
@@ -269,6 +329,83 @@ var orbitHistoryColumns = []printer.Column{ //nolint:gochecknoglobals
 	{Header: "DEACTIVATED", Extract: func(r interface{}) string {
 		return formatOptionalTime(r.(*apiclient.OrbitHistoryItem).DeactivatedAt) //nolint:errcheck
 	}},
+	{Header: "CONVERTED_FROM", Extract: func(r interface{}) string {
+		return conversionSummary(r.(*apiclient.OrbitHistoryItem).Conversion) //nolint:errcheck
+	}},
+	{Header: "UPLOAD_KEPT", Extract: func(r interface{}) string {
+		return strconv.FormatBool(r.(*apiclient.OrbitHistoryItem).HasUpload) //nolint:errcheck
+	}},
+}
+
+// newGetOrbitDataUploadCommand creates "get-orbit-data-upload", which prints the
+// OMM, Keplerian elements or OEM an orbit-data version was converted from.
+func newGetOrbitDataUploadCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "get-orbit-data-upload",
+		Short: "Show the OMM, Keplerian elements or OEM an orbit-data version was converted from",
+		Long: `Print orbit data exactly as it was uploaded, before StellarStation converted it
+to the TLE it stores: an OMM or OEM document as it was given, or Keplerian
+elements (and an OMM given as fields) as JSON. Find the orbit-data ID with
+get-orbit-data-history, whose UPLOAD_KEPT column says which versions have one.
+
+  stellar satellite get-orbit-data-upload --satellite-id <id> --orbit-data-id <orbit-data-id>
+  stellar satellite get-orbit-data-upload --satellite-id <id> --orbit-data-id <orbit-data-id> --output-file mysat.oem`,
+		RunE: runGetOrbitDataUpload,
+	}
+	cmd.Flags().String("satellite-id", "", "Which satellite (required)")
+	cmd.Flags().String("orbit-data-id", "", "Which orbit-data version (required; the ID from get-orbit-data-history)")
+	cmd.Flags().String("output-file", "", "Write the upload to this file instead of printing it")
+	_ = cmd.MarkFlagRequired("satellite-id")
+	_ = cmd.MarkFlagRequired("orbit-data-id")
+	return cmd
+}
+
+func runGetOrbitDataUpload(cmd *cobra.Command, _ []string) error {
+	client, err := newAPIClient(cmd)
+	if err != nil {
+		return err
+	}
+	satID, _ := cmd.Flags().GetString("satellite-id")
+	orbitDataID, _ := cmd.Flags().GetString("orbit-data-id")
+	outputFile, _ := cmd.Flags().GetString("output-file")
+
+	upload, err := client.GetOrbitDataUpload(cmd.Context(), satID, orbitDataID)
+	var apiErr *apiclient.APIError
+	if errors.As(err, &apiErr) && apiErr.IsNotFound() {
+		return fmt.Errorf("orbit data %s has no kept upload: it was uploaded as a TLE, synced automatically, "+
+			"or uploaded before uploads were kept", orbitDataID)
+	}
+	if err != nil {
+		return err
+	}
+	text, err := uploadText(upload)
+	if err != nil {
+		return err
+	}
+	if outputFile == "" {
+		_, err := fmt.Fprint(cmd.OutOrStdout(), text)
+		return err
+	}
+	if err := os.WriteFile(outputFile, []byte(text), 0o600); err != nil {
+		return fmt.Errorf("could not write %s: %w", outputFile, err)
+	}
+	uiOKf("Wrote the %s as uploaded to %s", upload.OrbitalDataType, outputFile)
+	return nil
+}
+
+// uploadText is an upload as the operator gave it: the OMM or OEM document
+// itself, or the fields as indented JSON.
+func uploadText(upload *apiclient.OrbitDataUpload) (string, error) {
+	for _, key := range []string{"omm", "oem"} {
+		if text, ok := upload.OrbitalData[key].(string); ok {
+			return text, nil
+		}
+	}
+	raw, err := json.MarshalIndent(upload.OrbitalData, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("encoding the upload: %w", err)
+	}
+	return string(raw) + "\n", nil
 }
 
 // newGetTLEHistoryCommand creates the "get-tle-history" subcommand, which lists
@@ -332,14 +469,22 @@ func newAddTLECommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "add-orbit-data",
 		Aliases: []string{"add-tle"},
-		Short:   "Upload new orbit data (TLE or OMM) for a satellite",
+		Short:   "Upload new orbit data (TLE, OMM, Keplerian elements or OEM) for a satellite",
 		Long: `Upload new orbit data for a satellite. Provide it inline with --data or from a
-file with --data-file, and say what kind it is with --data-type (TLE or OMM).
+file with --data-file, and say what kind it is with --data-type:
 
-TLE is accepted as a plain two-line element set or as JSON
-({"line1": "...", "line2": "..."}). OMM is accepted as JSON (the standard OMM
-mean-element field names). StellarStation converts an uploaded OMM to a TLE
-internally, so a TLE-only ground station is still served.
+  TLE        a two-line element set, or JSON {"line1": "...", "line2": "..."}
+  OMM        an OMM as CCSDS KVN or XML, the JSON CelesTrak and Space-Track serve,
+             or a JSON object of OMM fields. Its SGP4 mean elements are copied
+             into a TLE.
+  KEPLERIAN  osculating elements as JSON (see below). A TLE is fitted to a day of
+             the orbit they describe, since a TLE holds SGP4 mean elements.
+  OEM        a CCSDS OEM ephemeris (KVN or XML). A TLE is fitted to its states;
+             a fit that deviates more than 10 km is refused.
+
+Whatever is uploaded is stored and sent to ground stations as a TLE. Use
+--dry-run to see that TLE, and how closely a fitted one follows your orbit,
+without storing it.
 
 The satellite must be in manual mode (see set-orbit-data-source) to accept a
 manual upload.
@@ -355,20 +500,30 @@ Upload a TLE inline (mind the quoting; a here-doc is often easier):
 Upload an OMM from a file:
   stellar satellite add-orbit-data --satellite-id <id> --data-type OMM --data-file ./mysat.omm.json
 
-  where the OMM JSON looks like:
-  {"NORAD_CAT_ID": 25544, "EPOCH": "2026-05-08T12:00:00Z", "MEAN_MOTION": 15.5,
-   "ECCENTRICITY": 0.0007, "INCLINATION": 51.64, "RA_OF_ASC_NODE": 247.46,
-   "ARG_OF_PERICENTER": 130.5, "MEAN_ANOMALY": 325.0, "BSTAR": 0.00016}`,
+  (the file may be KVN, XML or JSON, e.g. CelesTrak's gp.php?CATNR=<id>&FORMAT=kvn)
+
+Check an OEM before storing it:
+  stellar satellite add-orbit-data --satellite-id <id> --data-type OEM --data-file ./mysat.oem --dry-run
+
+Upload Keplerian elements:
+  stellar satellite add-orbit-data --satellite-id <id> --data-type KEPLERIAN --data-file ./elements.json
+
+  where the JSON looks like (true_anomaly_deg or mean_anomaly_deg; frame EME2000,
+  GCRF or TEME; norad_id, international_designator and bstar are optional):
+  {"epoch": "2026-11-12T00:00:00Z", "semi_major_axis_km": 6878.137,
+   "eccentricity": 0.001, "inclination_deg": 97.4, "raan_deg": 120,
+   "arg_of_perigee_deg": 90, "true_anomaly_deg": 0, "frame": "EME2000"}`,
 		RunE: runAddTLE,
 	}
 	addOutputFlag(cmd)
 	cmd.Flags().String("satellite-id", "", "Which satellite (required; from list-satellites)")
-	cmd.Flags().String("data-type", "TLE", "Kind of orbit data being uploaded: TLE or OMM")
+	cmd.Flags().String("data-type", "TLE", "Kind of orbit data being uploaded: TLE, OMM, KEPLERIAN or OEM")
+	cmd.Flags().Bool("dry-run", false, "Check and convert the orbit data and show the resulting TLE, without storing it")
 	cmd.Flags().
 		String("source", "MANUAL", "Where this data came from: manual, space-track, or celestrak")
 	cmd.Flags().String("epoch", "", "Epoch of the orbit data, e.g. 2026-01-15T10:00:00Z (default: now)")
-	cmd.Flags().String("data", "", "The orbit data itself: a two-line TLE, TLE JSON, or OMM JSON (use this or --data-file)")
-	cmd.Flags().String("data-file", "", "Path to a file containing the orbit data (TLE text/JSON or OMM JSON)")
+	cmd.Flags().String("data", "", "The orbit data itself, in the form --data-type names (use this or --data-file)")
+	cmd.Flags().String("data-file", "", "Path to a file containing the orbit data")
 	_ = cmd.MarkFlagRequired("satellite-id")
 	return cmd
 }
@@ -386,9 +541,10 @@ func runAddTLE(cmd *cobra.Command, _ []string) error {
 	satID, _ := cmd.Flags().GetString("satellite-id")
 	dataType, _ := cmd.Flags().GetString("data-type")
 	dataType = strings.ToUpper(strings.TrimSpace(dataType))
-	if dataType != "TLE" && dataType != "OMM" {
-		return fmt.Errorf("unknown --data-type %q: use TLE or OMM", dataType)
+	if !slices.Contains(orbitDataTypes, dataType) {
+		return fmt.Errorf("unknown --data-type %q: use %s", dataType, strings.Join(orbitDataTypes, ", "))
 	}
+	dryRun, _ := cmd.Flags().GetBool("dry-run")
 	source, _ := cmd.Flags().GetString("source")
 	epochStr, _ := cmd.Flags().GetString("epoch")
 	dataStr, _ := cmd.Flags().GetString("data")
@@ -413,6 +569,24 @@ func runAddTLE(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
+	if dryRun {
+		checked, checkErr := client.ValidateOrbitData(cmd.Context(), satID, apiclient.ValidateOrbitDataRequest{
+			OrbitalDataType: dataType,
+			OrbitalData:     orbitalData,
+		})
+		if checkErr != nil {
+			return checkErr
+		}
+		reportOrbitFindings(checked.Warnings, checked.Errors)
+		if err := renderOne(cmd, format, orbitValidationColumns, checked, ""); err != nil {
+			return err
+		}
+		if !checked.Valid {
+			return errors.New("the orbit data was rejected; nothing was stored")
+		}
+		return nil
+	}
+
 	epoch := time.Now().UTC()
 	if epochStr != "" {
 		parsed, parseErr := parseTimeFlag(epochStr)
@@ -422,17 +596,47 @@ func runAddTLE(cmd *cobra.Command, _ []string) error {
 		epoch = *parsed
 	}
 
-	result, err := client.CreateOrbitData(cmd.Context(), satID, apiclient.OrbitDataCreateRequest{
+	result, err := client.CreateOrbitData(cmd.Context(), satID, apiclient.CreateOrbitDataRequest{
 		OrbitalDataType: dataType,
 		OrbitalData:     orbitalData,
-		// (OMM is converted to TLE server-side; the record is stored/served as TLE.)
+		// Every format is converted to a TLE server-side and stored as one.
 		Source: normalizeOrbitDataCreateSource(source),
 		Epoch:  epoch,
 	})
+	if rejected, ok := orbitRejection(err); ok {
+		reportOrbitFindings(rejected.Warnings, rejected.Errors)
+		return errors.New("the orbit data was rejected; nothing was stored")
+	}
 	if err != nil {
 		return err
 	}
+	reportOrbitFindings(result.Warnings, nil)
 	return renderOne(cmd, format, orbitDataColumns, result, "Orbit data uploaded and now active for scheduling.")
+}
+
+// orbitRejection reads the findings of an upload the API refused as invalid
+// (422), whose body is an OrbitValidationResult.
+func orbitRejection(err error) (*apiclient.OrbitValidationResult, bool) {
+	var apiErr *apiclient.APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusUnprocessableEntity {
+		return nil, false
+	}
+	var result apiclient.OrbitValidationResult
+	if json.Unmarshal([]byte(apiErr.RawBody), &result) != nil || len(result.Errors) == 0 {
+		return nil, false
+	}
+	return &result, true
+}
+
+// reportOrbitFindings prints why orbit data was refused, and what is worth
+// knowing about data that was accepted, on stderr so output stays parseable.
+func reportOrbitFindings(warnings []string, errs []apiclient.OrbitValidationError) {
+	for _, e := range errs {
+		uiErrf("%s: %s", e.Location, e.Message)
+	}
+	for _, w := range warnings {
+		uiWarnf("%s", w)
+	}
 }
 
 // newSetTLESourceCommand creates the "set-tle-source" subcommand.
@@ -474,7 +678,7 @@ func runSetTLESource(cmd *cobra.Command, _ []string) error {
 	noradID, _ := cmd.Flags().GetString("norad-id")
 
 	result, err := client.UpdateOrbitParameters(cmd.Context(), satID,
-		apiclient.OrbitParametersUpdateRequest{
+		apiclient.UpdateOrbitParametersRequest{
 			OrbitalDataSource: normalizeOrbitalDataParameterSource(source),
 			NoradID:           noradID,
 		})
@@ -482,4 +686,13 @@ func runSetTLESource(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 	return renderOne(cmd, format, orbitParamsColumns, result, "Orbit-data source updated.")
+}
+
+// effectiveOrbitType prefers the server's resolved type and falls back to the
+// manual field for older servers.
+func effectiveOrbitType(p *apiclient.OrbitParameters) string {
+	if p.EffectiveOrbitType != "" {
+		return p.EffectiveOrbitType
+	}
+	return p.OrbitType
 }
