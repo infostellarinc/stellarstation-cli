@@ -1,9 +1,12 @@
 package main
 
 import (
+	"reflect"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 
 	streaming "github.com/infostellarinc/stellarstation-cli/gen/pb/stellarstation/satellitestreamer"
@@ -57,7 +60,7 @@ func TestActivityCounter(t *testing.T) {
 		{"config", func() { stats.AddConfigMessage(SourceMQTT) }},
 		{"event", func() { stats.AddEventMessage(SourceMQTT) }},
 		{"ack received", func() { stats.AddAckReceived("env/pass/p/channel/c/uplink/ack", nil) }},
-		{"command sent", func() { stats.AddSentCommand("env/pass/p/channel/c/uplink", "uplink", 1) }},
+		{"command sent", func() { stats.AddSentCommand("env/pass/p/channel/c/uplink", "uplink", testCommandMsg(1)) }},
 		{"ack sent", func() { stats.MarkReceivedMessageAcked("env/pass/p/channel/c/downlink/BITSTREAM") }},
 	}
 	prev := stats.ActivityCount()
@@ -75,6 +78,68 @@ func TestActivityCounter(t *testing.T) {
 	b := stats.ActivityCount()
 	if a != b {
 		t.Errorf("ActivityCount changed with no activity: %d != %d", a, b)
+	}
+}
+
+// TestIdleShutdownScheduleFor verifies how --idle-timeout is split into the
+// idle-shutdown monitor's inactivity delay and close countdown: the warnings keep
+// their fixed distance from the close, the default reproduces the original fixed
+// timings, and a timeout too short for the standard countdown warns once at its
+// halfway point.
+func TestIdleShutdownScheduleFor(t *testing.T) {
+	standard := []idleShutdownWarning{{30 * time.Second, 1}, {10 * time.Second, 2}}
+	cases := []struct {
+		name    string
+		timeout time.Duration
+		want    idleShutdownSchedule
+	}{
+		{"default keeps the original 60 s delay and 60 s countdown", defaultIdleTimeout,
+			idleShutdownSchedule{inactivityDelay: 60 * time.Second, grace: 60 * time.Second, warnings: standard}},
+		{"longer timeout extends only the delay", 5 * time.Minute,
+			idleShutdownSchedule{inactivityDelay: 4 * time.Minute, grace: 60 * time.Second, warnings: standard}},
+		{"exactly the countdown announces as soon as idle", 60 * time.Second,
+			idleShutdownSchedule{inactivityDelay: 0, grace: 60 * time.Second, warnings: standard}},
+		{"shorter than the countdown warns once at half", 20 * time.Second,
+			idleShutdownSchedule{inactivityDelay: 0, grace: 20 * time.Second,
+				warnings: []idleShutdownWarning{{10 * time.Second, 2}}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := idleShutdownScheduleFor(tc.timeout)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("idleShutdownScheduleFor(%s) = %+v, want %+v", tc.timeout, got, tc.want)
+			}
+			if got.inactivityDelay+got.grace != tc.timeout {
+				t.Errorf("delay %s + countdown %s != timeout %s", got.inactivityDelay, got.grace, tc.timeout)
+			}
+		})
+	}
+}
+
+// TestCrossedIdleWarning verifies the countdown prints the most urgent warning
+// whose threshold has been reached, skipping any less urgent one crossed in the
+// same tick, and never repeats one.
+func TestCrossedIdleWarning(t *testing.T) {
+	warnings := []idleShutdownWarning{{30 * time.Second, 1}, {10 * time.Second, 2}}
+	cases := []struct {
+		name      string
+		next      int
+		remaining time.Duration
+		want      int
+	}{
+		{"none crossed yet", 0, 45 * time.Second, -1},
+		{"30 s crossed", 0, 30 * time.Second, 0},
+		{"both crossed at once picks the most urgent", 0, 5 * time.Second, 1},
+		{"30 s already printed", 1, 20 * time.Second, -1},
+		{"10 s after 30 s", 1, 9 * time.Second, 1},
+		{"all printed", 2, 1 * time.Second, -1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := crossedIdleWarning(warnings, tc.next, tc.remaining); got != tc.want {
+				t.Errorf("crossedIdleWarning(next=%d, remaining=%s) = %d, want %d", tc.next, tc.remaining, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -316,10 +381,27 @@ func marshalStatsAck(t *testing.T, status streaming.Ack_Status, index uint64, re
 
 func TestAddAckReceived(t *testing.T) {
 	stats := newStatsTracker(false)
-	stats.AddAckReceived("pass-123/ack/uplink", marshalStatsAck(t, streaming.Ack_ACK, 1, ""))
+	stats.AddAckReceived("pass-123/uplink/ack", marshalStatsAck(t, streaming.Ack_ACK, 2, ""))
+	if stats.acksReceived != 0 {
+		t.Errorf("an ack for no command of ours was counted: %v", stats.acksReceived)
+	}
+	stats.AddSentCommand("pass-123/uplink", "uplink", testCommandMsg(1))
+	stats.AddAckReceived("pass-123/uplink/ack", marshalStatsAck(t, streaming.Ack_ACK, 1, ""))
 	if stats.acksReceived != 1 {
 		t.Errorf("Acks received = %v, want 1", stats.acksReceived)
 	}
+}
+
+// Two clients command one channel, so both see every ack on its topic. Each
+// counts and resolves only its own stream's replies.
+func TestAddAckReceivedIgnoresOtherStreams(t *testing.T) {
+	stats := newStatsTracker(false)
+	cmd := stats.AddSentCommand("pass-123/uplink", "uplink", testCommandMsg(1))
+	other, err := proto.Marshal(&streaming.Ack{StreamId: "other-stream", Index: 1, Status: streaming.Ack_NACK})
+	require.NoError(t, err)
+	stats.AddAckReceived("pass-123/uplink/ack", other)
+	assert.Zero(t, stats.nacksReceived)
+	assert.False(t, stats.commandSnapshot(cmd).rejected)
 }
 
 // A payload that does not decode as a proto Ack is neither an ACK nor a NACK:
@@ -327,7 +409,7 @@ func TestAddAckReceived(t *testing.T) {
 // delivered.
 func TestAddAckReceivedMalformedPayload(t *testing.T) {
 	stats := newStatsTracker(false)
-	stats.AddSentCommand("pass-123/uplink", "uplink", 1)
+	stats.AddSentCommand("pass-123/uplink", "uplink", testCommandMsg(1))
 
 	stats.AddAckReceived("pass-123/uplink/ack", []byte{0xff, 0xff})
 
@@ -346,8 +428,8 @@ func TestAddAckReceivedMalformedPayload(t *testing.T) {
 // even when they arrive out of order.
 func TestAddAckReceivedMatchesByIndex(t *testing.T) {
 	stats := newStatsTracker(false)
-	stats.AddSentCommand("pass-123/uplink", "uplink", 1)
-	stats.AddSentCommand("pass-123/uplink", "uplink", 2)
+	stats.AddSentCommand("pass-123/uplink", "uplink", testCommandMsg(1))
+	stats.AddSentCommand("pass-123/uplink", "uplink", testCommandMsg(2))
 
 	// The NACK for index 2 arrives first; it must not mark index 1 rejected.
 	stats.AddAckReceived("pass-123/uplink/ack", marshalStatsAck(t, streaming.Ack_NACK, 2, "malformed payload"))
@@ -369,8 +451,8 @@ func TestAddAckReceivedMatchesByIndex(t *testing.T) {
 // a tracked error so the defect is visible.
 func TestAddAckReceivedIndexlessAckIsTrackedError(t *testing.T) {
 	stats := newStatsTracker(true)
-	stats.AddSentCommand("pass-123/uplink", "uplink", 1)
-	stats.AddSentCommand("pass-123/uplink", "uplink", 2)
+	stats.AddSentCommand("pass-123/uplink", "uplink", testCommandMsg(1))
+	stats.AddSentCommand("pass-123/uplink", "uplink", testCommandMsg(2))
 
 	stats.AddAckReceived("pass-123/uplink/ack", marshalStatsAck(t, streaming.Ack_ACK, 0, ""))
 
@@ -393,13 +475,13 @@ func TestAddAckReceivedIndexlessAckIsTrackedError(t *testing.T) {
 // matches no particular command, and it is not an error.
 func TestAddAckReceivedIndexlessNackMatchesNothing(t *testing.T) {
 	stats := newStatsTracker(true)
-	stats.AddSentCommand("pass-123/uplink", "uplink", 1)
+	stats.AddSentCommand("pass-123/uplink", "uplink", testCommandMsg(1))
 
 	nack := marshalStatsAck(t, streaming.Ack_NACK, 0, "malformed payload")
 	stats.AddAckReceived("pass-123/uplink/ack", nack)
 
-	if stats.nacksReceived != 1 {
-		t.Errorf("Nacks received = %v, want 1", stats.nacksReceived)
+	if stats.nacksReceived != 0 {
+		t.Errorf("Nacks received = %v, want 0: the NACK may answer another client", stats.nacksReceived)
 	}
 	if stats.sentCommands[0].rejected || stats.sentCommands[0].acked {
 		t.Error("an index-less NACK changed a command's delivery state")
@@ -412,16 +494,16 @@ func TestAddAckReceivedIndexlessNackMatchesNothing(t *testing.T) {
 	}
 }
 
-// A duplicate acknowledgement for an already-settled index is a no-op:
-// duplicate indexed acks can occur (for example when another client answers
-// the same commands) and must not error or re-mark anything.
+// A second, distinct acknowledgement for an already-settled index is counted
+// but is otherwise a no-op: duplicate indexed acks can occur (for example when
+// another client answers the same commands) and must not error or re-mark
+// anything.
 func TestAddAckReceivedDuplicateIndexIsNoOp(t *testing.T) {
 	stats := newStatsTracker(true)
-	stats.AddSentCommand("pass-123/uplink", "uplink", 1)
+	stats.AddSentCommand("pass-123/uplink", "uplink", testCommandMsg(1))
 
-	ack := marshalStatsAck(t, streaming.Ack_ACK, 1, "")
-	stats.AddAckReceived("pass-123/uplink/ack", ack)
-	stats.AddAckReceived("pass-123/uplink/ack", ack)
+	stats.AddAckReceived("pass-123/uplink/ack", marshalStatsAck(t, streaming.Ack_ACK, 1, ""))
+	stats.AddAckReceived("pass-123/uplink/ack", marshalStatsAck(t, streaming.Ack_ACK, 1, "second"))
 
 	if stats.acksReceived != 2 {
 		t.Errorf("Acks received = %v, want 2", stats.acksReceived)
@@ -440,9 +522,9 @@ func TestAddAckReceivedDuplicateIndexIsNoOp(t *testing.T) {
 // A rejection on the ack topic must not be recorded as a delivered command.
 func TestAddAckReceivedNack(t *testing.T) {
 	stats := newStatsTracker(false)
-	stats.AddSentCommand("pass-123/uplink", "uplink", 1)
+	stats.AddSentCommand("pass-123/uplink", "uplink", testCommandMsg(1))
 
-	nack := marshalStatsAck(t, streaming.Ack_NACK, 1, "command is for a different plan")
+	nack := marshalStatsAck(t, streaming.Ack_NACK, 1, "the command is for a different pass")
 	stats.AddAckReceived("pass-123/uplink/ack", nack)
 
 	if stats.acksReceived != 0 {
@@ -470,7 +552,7 @@ func TestAddAckReceivedAckStatusVariants(t *testing.T) {
 		marshalStatsAckStatusVariant(t, false),
 	} {
 		stats := newStatsTracker(false)
-		stats.AddSentCommand("pass-123/uplink", "uplink", 1)
+		stats.AddSentCommand("pass-123/uplink", "uplink", testCommandMsg(1))
 		stats.AddAckReceived("pass-123/uplink/ack", payload)
 		if stats.acksReceived != 1 {
 			t.Errorf("payload %s: acks received = %v, want 1", payload, stats.acksReceived)
@@ -491,7 +573,7 @@ func TestAddReceivedMessage(t *testing.T) {
 
 func TestAddSentCommand(t *testing.T) {
 	stats := newStatsTracker(false)
-	stats.AddSentCommand("pass-123/uplink", "uplink", 1)
+	stats.AddSentCommand("pass-123/uplink", "uplink", testCommandMsg(1))
 	if len(stats.sentCommands) != 1 {
 		t.Errorf("Sent commands count = %v, want 1", len(stats.sentCommands))
 	}
@@ -508,18 +590,18 @@ func TestGetUnackedReceivedMessages(t *testing.T) {
 
 func TestGetUnackedSentCommands(t *testing.T) {
 	stats := newStatsTracker(false)
-	stats.AddSentCommand("pass-123/uplink", "uplink", 1)
+	stats.AddSentCommand("pass-123/uplink", "uplink", testCommandMsg(1))
 	unacked := stats.GetUnackedSentCommands()
 	if len(unacked) != 1 {
 		t.Errorf("Unacked commands count = %v, want 1", len(unacked))
 	}
 }
 
-func TestGetAllSentCommands(t *testing.T) {
+func TestCommandSnapshots(t *testing.T) {
 	stats := newStatsTracker(false)
-	stats.AddSentCommand("pass-123/uplink", "uplink", 1)
-	stats.AddSentCommand("pass-123/config_request", "config_request", 2)
-	all := stats.GetAllSentCommands()
+	stats.AddSentCommand("pass-123/uplink", "uplink", testCommandMsg(1))
+	stats.AddSentCommand("pass-123/config_request", "config_request", testCommandMsg(2))
+	all := stats.commandSnapshots()
 	if len(all) != 2 {
 		t.Errorf("All sent commands count = %v, want 2", len(all))
 	}

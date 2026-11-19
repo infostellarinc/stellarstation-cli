@@ -458,7 +458,7 @@ func TestGetBucket(t *testing.T) {
 
 func TestValidateBasicFlags(t *testing.T) {
 	t.Run("zero window size corrected to 1", func(t *testing.T) {
-		flags := &flagSet{windowSize: 0, mqttQoS: 1}
+		flags := &flagSet{windowSize: 0, mqttQoS: 1, waitTimeout: defaultCommandWaitTimeout}
 		validateBasicFlags(flags)
 		if flags.windowSize != 1 {
 			t.Errorf("windowSize = %d, want 1", flags.windowSize)
@@ -466,7 +466,7 @@ func TestValidateBasicFlags(t *testing.T) {
 	})
 
 	t.Run("negative window size corrected to 1", func(t *testing.T) {
-		flags := &flagSet{windowSize: -5, mqttQoS: 1}
+		flags := &flagSet{windowSize: -5, mqttQoS: 1, waitTimeout: defaultCommandWaitTimeout}
 		validateBasicFlags(flags)
 		if flags.windowSize != 1 {
 			t.Errorf("windowSize = %d, want 1", flags.windowSize)
@@ -474,7 +474,7 @@ func TestValidateBasicFlags(t *testing.T) {
 	})
 
 	t.Run("valid window size unchanged", func(t *testing.T) {
-		flags := &flagSet{windowSize: 100, mqttQoS: 1}
+		flags := &flagSet{windowSize: 100, mqttQoS: 1, waitTimeout: defaultCommandWaitTimeout}
 		validateBasicFlags(flags)
 		if flags.windowSize != 100 {
 			t.Errorf("windowSize = %d, want 100", flags.windowSize)

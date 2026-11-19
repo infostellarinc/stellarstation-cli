@@ -11,6 +11,8 @@ import (
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/infostellarinc/stellarstation-cli/internal/apiclient"
 	"github.com/infostellarinc/stellarstation-cli/internal/auth"
@@ -251,162 +253,158 @@ func TestParseHexCommand(t *testing.T) {
 	}
 }
 
-func TestHandleOneShotSatCommand(t *testing.T) {
-	tests := []struct {
-		name            string
-		sendSatCommand  string
-		sendCommandFunc func(string, uint32) error
-		wantErr         bool
-	}{
-		{
-			name:           "empty command",
-			sendSatCommand: "",
-			sendCommandFunc: func(string, uint32) error {
-				return errors.New("should not be called")
-			},
-			wantErr: false,
-		},
-		{
-			name:           "valid command",
-			sendSatCommand: "aaaabbbb",
-			sendCommandFunc: func(cmd string, idx uint32) error {
-				if cmd != "aaaabbbb" {
-					return errors.New("unexpected command")
-				}
-				if idx != 1 {
-					return errors.New("unexpected index")
-				}
-				return nil
-			},
-			wantErr: false,
-		},
-		{
-			name:           "command error",
-			sendSatCommand: "aaaabbbb",
-			sendCommandFunc: func(string, uint32) error {
-				return errors.New("send error")
-			},
-			wantErr: true,
-		},
-	}
+// recordingSend is a commandSendFunc that records each call and fails on
+// the payload "fail".
+type recordingSend struct {
+	payloads []string
+	indexes  []uint32
+}
 
+func (r *recordingSend) send(payload string, index uint32) (*sentCommand, error) {
+	if payload == "fail" {
+		return nil, errors.New("send error")
+	}
+	r.payloads = append(r.payloads, payload)
+	r.indexes = append(r.indexes, index)
+	return &sentCommand{index: index}, nil
+}
+
+func TestHandleOneShotSends(t *testing.T) {
+	type handler func(string, commandSendFunc, waitMode) ([]*sentCommand, error)
+	tests := []struct {
+		name        string
+		handle      handler
+		payload     string
+		wantSent    []string
+		wantIndexes []uint32
+		wantErr     bool
+	}{
+		{name: "single command, empty", handle: handleOneShotSatCommand, payload: ""},
+		{
+			name: "single command", handle: handleOneShotSatCommand, payload: "0A1B2C3D",
+			wantSent: []string{"0A1B2C3D"}, wantIndexes: []uint32{1},
+		},
+		{name: "single command, error", handle: handleOneShotSatCommand, payload: "fail", wantErr: true},
+		{name: "several commands, empty", handle: handleOneShotSatCommands, payload: ""},
+		{
+			name: "several commands, indexed from 1 in order", handle: handleOneShotSatCommands,
+			payload: "0A1B,2C3D", wantSent: []string{"0A1B", "2C3D"}, wantIndexes: []uint32{1, 2},
+		},
+		{
+			name: "several commands, stops at the first error", handle: handleOneShotSatCommands,
+			payload: "0A1B,fail,2C3D", wantSent: []string{"0A1B"}, wantIndexes: []uint32{1}, wantErr: true,
+		},
+		{name: "config request, empty", handle: handleOneShotGsConfig, payload: ""},
+		{
+			name: "config request", handle: handleOneShotGsConfig, payload: "{}",
+			wantSent: []string{"{}"}, wantIndexes: []uint32{1},
+		},
+		{name: "config request, error", handle: handleOneShotGsConfig, payload: "fail", wantErr: true},
+	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := handleOneShotSatCommand(tt.sendSatCommand, tt.sendCommandFunc)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("handleOneShotSatCommand() error = %v, wantErr %v", err, tt.wantErr)
+			rec := &recordingSend{}
+			sent, err := tt.handle(tt.payload, rec.send, waitForReceived)
+			if tt.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
 			}
+			assert.Equal(t, tt.wantSent, rec.payloads)
+			assert.Equal(t, tt.wantIndexes, rec.indexes)
+			assert.Len(t, sent, len(tt.wantSent))
 		})
 	}
 }
 
-func TestHandleOneShotSatCommands(t *testing.T) {
+// dispatchOneShotCommands sends only the first one-shot payload given and
+// passes exactly what it sent to the wait.
+func TestDispatchOneShotCommands(t *testing.T) {
+	waitErr := &exitCodeError{code: exitUnknown}
 	tests := []struct {
-		name            string
-		sendSatCommands string
-		sendCommandFunc func(string, uint32) error
-		wantErr         bool
+		name                      string
+		sat, sats, gs             string
+		awaitErr                  error
+		wantSent                  bool
+		wantSat, wantGs, wantWait []uint32
+		wantErr                   error
 	}{
+		{name: "nothing to send"},
+		{name: "one command", sat: "0A1B", wantSent: true, wantSat: []uint32{1}, wantWait: []uint32{1}},
 		{
-			name:            "empty commands",
-			sendSatCommands: "",
-			sendCommandFunc: func(string, uint32) error {
-				return errors.New("should not be called")
-			},
-			wantErr: false,
+			name: "several commands", sats: "0A1B,2C3D", gs: "{}", wantSent: true,
+			wantSat: []uint32{1, 2}, wantWait: []uint32{1, 2},
 		},
+		{name: "config request", gs: "{}", wantSent: true, wantGs: []uint32{1}, wantWait: []uint32{1}},
 		{
-			name:            "single command",
-			sendSatCommands: "aaaabbbb",
-			sendCommandFunc: func(cmd string, idx uint32) error {
-				if cmd != "aaaabbbb" {
-					return errors.New("unexpected command")
-				}
-				if idx != 1 {
-					return errors.New("unexpected index")
-				}
-				return nil
-			},
-			wantErr: false,
-		},
-		{
-			name:            "multiple commands",
-			sendSatCommands: "aaaabbbb,12345678",
-			sendCommandFunc: func(cmd string, idx uint32) error {
-				if idx > 2 {
-					return errors.New("unexpected index")
-				}
-				return nil
-			},
-			wantErr: false,
-		},
-		{
-			name:            "command error",
-			sendSatCommands: "aaaabbbb",
-			sendCommandFunc: func(string, uint32) error {
-				return errors.New("send error")
-			},
-			wantErr: true,
+			name: "wait result is returned", sat: "0A1B", awaitErr: waitErr, wantSent: true,
+			wantSat: []uint32{1}, wantWait: []uint32{1}, wantErr: waitErr,
 		},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := handleOneShotSatCommands(tt.sendSatCommands, tt.sendCommandFunc)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("handleOneShotSatCommands() error = %v, wantErr %v", err, tt.wantErr)
-			}
+			sat, gs := &recordingSend{}, &recordingSend{}
+			var waited []uint32
+			sent, err := dispatchOneShotCommands(tt.sat, tt.sats, tt.gs, sat.send, gs.send, waitForReceived,
+				func(cmds []*sentCommand) error {
+					for _, c := range cmds {
+						waited = append(waited, c.index)
+					}
+					return tt.awaitErr
+				})
+			assert.Equal(t, tt.wantErr, err)
+			assert.Equal(t, tt.wantSent, sent)
+			assert.Equal(t, tt.wantSat, sat.indexes)
+			assert.Equal(t, tt.wantGs, gs.indexes)
+			assert.Equal(t, tt.wantWait, waited)
 		})
 	}
 }
 
-func TestHandleOneShotGsConfig(t *testing.T) {
-	tests := []struct {
-		name           string
-		sendGsConfig   string
-		sendConfigFunc func(string, uint32) error
-		wantErr        bool
-	}{
-		{
-			name:         "empty config",
-			sendGsConfig: "",
-			sendConfigFunc: func(string, uint32) error {
-				return errors.New("should not be called")
-			},
-			wantErr: false,
-		},
-		{
-			name:         "valid config",
-			sendGsConfig: "{}",
-			sendConfigFunc: func(config string, idx uint32) error {
-				if config != "{}" {
-					return errors.New("unexpected config")
-				}
-				if idx != 1 {
-					return errors.New("unexpected index")
-				}
-				return nil
-			},
-			wantErr: false,
-		},
-		{
-			name:         "config error",
-			sendGsConfig: "{}",
-			sendConfigFunc: func(string, uint32) error {
-				return errors.New("send error")
-			},
-			wantErr: true,
-		},
-	}
+func TestDispatchOneShotCommandsSendError(t *testing.T) {
+	rec := &recordingSend{}
+	awaited := false
+	sent, err := dispatchOneShotCommands("fail", "", "", rec.send, rec.send, waitForReceived,
+		func([]*sentCommand) error { awaited = true; return nil })
+	require.Error(t, err)
+	assert.False(t, sent)
+	assert.False(t, awaited, "nothing was sent, so nothing may be awaited")
+}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := handleOneShotGsConfig(tt.sendGsConfig, tt.sendConfigFunc)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("handleOneShotGsConfig() error = %v, wantErr %v", err, tt.wantErr)
-			}
-		})
+// A batch stops at the first command that cannot be sent, but the commands
+// already published still get their results.
+func TestDispatchOneShotCommandsBatchAwaitsWhatWasSent(t *testing.T) {
+	rec := &recordingSend{}
+	var awaited []*sentCommand
+	sent, err := dispatchOneShotCommands("", "AA,fail,BB", "", rec.send, rec.send, waitForReceived,
+		func(cmds []*sentCommand) error { awaited = cmds; return nil })
+	require.Error(t, err)
+	assert.True(t, sent)
+	assert.Equal(t, []string{"AA"}, rec.payloads)
+	require.Len(t, awaited, 1)
+	assert.Equal(t, uint32(1), awaited[0].index)
+}
+
+func TestFirstCommandable(t *testing.T) {
+	creds := &AuthorizerCredentials{
+		Channels: []ChannelMetadata{{ChannelID: "dl", Direction: "downlink"}, {ChannelID: "ul", Direction: "uplink"}},
+		Streams: StreamsConfig{Uplink: []CommandConfig{
+			{PublishTopic: "env/pass/p1/channel/dl/uplink"},
+			{PublishTopic: "env/pass/p1/channel/ul/uplink"},
+		}},
 	}
+	assert.Equal(t, "env/pass/p1/channel/ul/uplink", firstCommandable(creds, creds.Streams.Uplink).PublishTopic)
+	assert.Empty(t, firstCommandable(creds, creds.Streams.ConfigRequest).PublishTopic, "no config topics")
+
+	creds.Channels = nil
+	assert.Equal(t, "env/pass/p1/channel/dl/uplink", firstCommandable(creds, creds.Streams.Uplink).PublishTopic,
+		"without directions the first channel is used")
+}
+
+func TestWaitingNote(t *testing.T) {
+	assert.Equal(t, "Command sent. Waiting for acknowledgement...", waitingNote("Command sent.", waitForReceived))
+	assert.Equal(t, "Command sent. Waiting for acknowledgement and delivery status...",
+		waitingNote("Command sent.", waitForFinal))
 }
 
 func TestResolveAllCommandTargets(t *testing.T) {
@@ -824,53 +822,32 @@ func (m *mockToken) Done() <-chan struct{} {
 	return ch
 }
 
-func TestCreateSendSatCommandFunc(t *testing.T) {
-	ctx := t.Context()
-	client := &mockMQTTClient{connected: true}
-	cfg := Config{MQTTQoS: 1}
-	stats := newStatsTracker(false)
-
-	sendFunc := createSendSatCommandFunc(
-		ctx,
-		client,
-		"dev/pass-123/uplink",
-		"stream-1",
-		"plan-1",
-		cfg,
-		stats,
-	)
-
-	err := sendFunc("aaaabbbb", 1)
-	if err != nil {
-		t.Fatalf("createSendSatCommandFunc() error = %v", err)
+func TestCreateSendFuncs(t *testing.T) {
+	tests := []struct {
+		name    string
+		create  func(*commandPublisher, string, string, string) commandSendFunc
+		payload string
+		wantErr bool
+	}{
+		{name: "satellite command", create: createSendSatCommandFunc, payload: "0A1B2C3D"},
+		{name: "satellite command, bad hex", create: createSendSatCommandFunc, payload: "0G", wantErr: true},
+		{name: "config request", create: createSendGsConfigFunc, payload: "{}"},
+		{name: "config request, empty", create: createSendGsConfigFunc, payload: ""},
+		{name: "config request, bad JSON", create: createSendGsConfigFunc, payload: "{", wantErr: true},
 	}
-	if !client.published {
-		t.Error("Command should have been published")
-	}
-}
-
-func TestCreateSendGsConfigFunc(t *testing.T) {
-	ctx := t.Context()
-	client := &mockMQTTClient{connected: true}
-	cfg := Config{MQTTQoS: 1}
-	stats := newStatsTracker(false)
-
-	sendFunc := createSendGsConfigFunc(
-		ctx,
-		client,
-		"dev/pass-123/config_request",
-		"stream-1",
-		"plan-1",
-		cfg,
-		stats,
-	)
-
-	err := sendFunc("{}", 1)
-	if err != nil {
-		t.Fatalf("createSendGsConfigFunc() error = %v", err)
-	}
-	if !client.published {
-		t.Error("Config should have been published")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &mockMQTTClient{connected: true}
+			cmd, err := tt.create(newTestPublisher(t, client), "dev/pass-123/x", "stream-1", "plan-1")(tt.payload, 7)
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.False(t, client.published)
+				return
+			}
+			require.NoError(t, err)
+			assert.True(t, client.published)
+			assert.Equal(t, uint32(7), cmd.index)
+		})
 	}
 }
 

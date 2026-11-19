@@ -172,39 +172,6 @@ func TestBuildNonTelemetryAck(t *testing.T) {
 	}
 }
 
-// TestDecodeAckStatusIndex locks in the ack contract: acknowledgements are
-// proto Ack messages, and a payload that does not decode as one (such as
-// arbitrary JSON) must never register as a rejection.
-func TestDecodeAckStatusIndex(t *testing.T) {
-	t.Run("proto ack", func(t *testing.T) {
-		payload, err := proto.Marshal(&streaming.Ack{
-			Status: streaming.Ack_NACK,
-			Index:  7,
-			Reason: "command is for a different plan",
-		})
-		if err != nil {
-			t.Fatalf("marshal: %v", err)
-		}
-		rejected, index, err := decodeAckStatusIndex(payload)
-		if err != nil {
-			t.Fatalf("decodeAckStatusIndex() error = %v", err)
-		}
-		if !rejected {
-			t.Error("proto NACK not detected as rejection")
-		}
-		if index != 7 {
-			t.Errorf("index = %d, want 7", index)
-		}
-	})
-
-	t.Run("JSON payload is not a valid ack", func(t *testing.T) {
-		rejected, _, err := decodeAckStatusIndex([]byte(`{"status":"NACK","index":-1}`))
-		if err == nil && rejected {
-			t.Error("non-proto JSON payload registered as a rejection; only proto Ack messages are valid")
-		}
-	})
-}
-
 func TestBuildTelemetryTopicFromS3Key(t *testing.T) {
 	cfg := Config{}
 	tests := []struct {

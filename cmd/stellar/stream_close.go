@@ -47,23 +47,68 @@ func callStreamCloseAPI(
 		vlogf("Skipping stream close API call: API URL not configured")
 		return nil
 	}
-
 	vlogf("Calling stream close API for pass %s stream %s", passID, streamID)
-
-	closeURL := strings.TrimRight(baseURL, "/") + "/stream/close"
-
-	reqBody := StreamCloseRequest{
+	err := postStreamAction(ctx, baseURL, tokenSource, "/stream/close", StreamCloseRequest{
 		PassID:   passID,
 		StreamID: streamID,
 		Source:   "streamer",
+	})
+	if err != nil {
+		vlogf("Stream close API call failed: %v", err)
+		return err
 	}
+	vlogf("Successfully called stream close API for pass %s stream %s", passID, streamID)
+	return nil
+}
 
-	bodyJSON, err := json.Marshal(reqBody)
+// StreamRevokeRequest is the request body for the stream revoke API.
+type StreamRevokeRequest struct {
+	PassID   string `json:"passId"`
+	StreamID string `json:"streamId"`
+	Reason   string `json:"reason,omitempty"`
+}
+
+// callStreamRevokeAPI revokes another stream on a pass: the authorizer closes
+// it and revokes its credentials.
+func callStreamRevokeAPI(
+	ctx context.Context,
+	baseURL string,
+	tokenSource auth.TokenSource,
+	req StreamRevokeRequest,
+) error {
+	return postStreamAction(ctx, baseURL, tokenSource, "/stream/revoke", req)
+}
+
+// streamActionError is a refusal from a stream endpoint.
+type streamActionError struct {
+	Status  int
+	Code    string
+	Message string
+}
+
+func (e *streamActionError) Error() string {
+	if e.Message == "" {
+		return fmt.Sprintf("%s returned status %d", e.Code, e.Status)
+	}
+	return e.Message
+}
+
+// postStreamAction POSTs body to one of the authorizer's stream endpoints,
+// authenticated like /authorize. A refusal is a *streamActionError.
+func postStreamAction(
+	ctx context.Context,
+	baseURL string,
+	tokenSource auth.TokenSource,
+	path string,
+	body any,
+) error {
+	bodyJSON, err := json.Marshal(body)
 	if err != nil {
 		return fmt.Errorf("marshal request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, closeURL, bytes.NewReader(bodyJSON))
+	url := strings.TrimRight(baseURL, "/") + path
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyJSON))
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
@@ -71,7 +116,7 @@ func callStreamCloseAPI(
 	if tokenSource != nil {
 		token, tokErr := tokenSource.Token(ctx)
 		if tokErr != nil {
-			return fmt.Errorf("obtain access token for stream close: %w", tokErr)
+			return fmt.Errorf("obtain access token for %s: %w", path, tokErr)
 		}
 		if token != "" {
 			req.Header.Set("Authorization", "Bearer "+token)
@@ -81,17 +126,23 @@ func callStreamCloseAPI(
 	client := &http.Client{Timeout: streamCloseTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
-		vlogf("Error calling stream close API: %v", err)
 		return fmt.Errorf("API request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		vlogf("Stream close API returned status %d: %s", resp.StatusCode, string(body))
-		return fmt.Errorf("stream close API returned status %d: %s", resp.StatusCode, string(body))
+	if resp.StatusCode == http.StatusOK {
+		return nil
 	}
-
-	vlogf("Successfully called stream close API for pass %s stream %s", passID, streamID)
-	return nil
+	raw, _ := io.ReadAll(resp.Body)
+	refusal := &streamActionError{Status: resp.StatusCode, Code: path}
+	var decoded struct {
+		Error   string `json:"error"`
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(raw, &decoded) == nil && decoded.Error != "" {
+		refusal.Code, refusal.Message = decoded.Error, decoded.Message
+	} else {
+		refusal.Message = fmt.Sprintf("%s returned status %d: %s", path, resp.StatusCode, raw)
+	}
+	return refusal
 }

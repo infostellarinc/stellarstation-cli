@@ -6,6 +6,8 @@ import (
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 
 	streaming "github.com/infostellarinc/stellarstation-cli/gen/pb/stellarstation/satellitestreamer"
@@ -98,187 +100,114 @@ func (m *mockTokenWriter) Done() <-chan struct{} {
 	return ch
 }
 
-func TestPublishCommand(t *testing.T) {
-	client := &mockMQTTClientWriter{connected: true}
-	stats := newStatsTracker(false)
+func newTestPublisher(t *testing.T, client mqtt.Client) *commandPublisher {
+	t.Helper()
+	return newCommandPublisher(client, 1, newStatsTracker(false), passWindow{})
+}
 
-	msg := &streaming.ToStarPassMessage{
-		StreamId: "stream-1",
-		PassId:   "plan-1",
-		Index:    1,
-	}
+const testUplinkTopic = "dev/pass/p1/channel/c1/uplink"
 
-	err := publishCommand(client, "test/topic", 1, msg, stats, "uplink", 1)
-	if err != nil {
-		t.Fatalf("publishCommand() error = %v", err)
+func TestPublishSatCommandAndGsConfig(t *testing.T) {
+	tests := []struct {
+		name        string
+		publish     func(*commandPublisher) (*sentCommand, error)
+		wantType    string
+		wantCommand []byte
+		wantConfig  bool
+	}{
+		{
+			name: "satellite command",
+			publish: func(p *commandPublisher) (*sentCommand, error) {
+				return PublishSatCommand(p, testUplinkTopic, "stream-1", "plan-1", 3, [][]byte{{0x0A, 0x1B}})
+			},
+			wantType:    cmdTypeUplink,
+			wantCommand: []byte{0x0A, 0x1B},
+		},
+		{
+			name: "config request",
+			publish: func(p *commandPublisher) (*sentCommand, error) {
+				return PublishGsConfig(p, testUplinkTopic, "stream-1", "plan-1", 3,
+					&v1.GroundStationConfigurationRequest{})
+			},
+			wantType:   cmdTypeConfigRequest,
+			wantConfig: true,
+		},
 	}
-	if !client.published {
-		t.Error("Command should have been published")
-	}
-	if client.pubTopic != "test/topic" {
-		t.Errorf("Published topic = %v, want test/topic", client.pubTopic)
-	}
-	if client.pubQoS != 1 {
-		t.Errorf("Published QoS = %v, want 1", client.pubQoS)
-	}
-	if len(stats.sentCommands) != 1 {
-		t.Errorf("Sent commands count = %v, want 1", len(stats.sentCommands))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &mockMQTTClientWriter{connected: true}
+			pub := newTestPublisher(t, client)
+
+			cmd, err := tt.publish(pub)
+			require.NoError(t, err)
+			assert.Equal(t, testUplinkTopic, client.pubTopic)
+			assert.Equal(t, byte(1), client.pubQoS)
+
+			var msg streaming.ToStarPassMessage
+			require.NoError(t, proto.Unmarshal(client.pubPayload, &msg))
+			assert.Equal(t, "stream-1", msg.GetStreamId())
+			assert.Equal(t, "plan-1", msg.GetPassId())
+			assert.Equal(t, uint32(3), msg.GetIndex())
+			assert.NotEmpty(t, msg.GetMessageId())
+			if tt.wantCommand != nil {
+				assert.Equal(t, [][]byte{tt.wantCommand}, msg.GetCommand())
+			}
+			assert.Equal(t, tt.wantConfig, msg.GetGroundStationConfigurationRequest() != nil)
+
+			assert.Equal(t, tt.wantType, cmd.cmdType)
+			assert.Equal(t, msg.GetMessageId(), cmd.messageID)
+			assert.Equal(t, "stream-1", cmd.streamID)
+			assert.Len(t, pub.stats.sentCommands, 1)
+		})
 	}
 }
 
-func TestPublishCommandNotConnected(t *testing.T) {
-	// Note: publishCommand itself doesn't check connection status.
-	// The connection check is done in PublishSatCommand and PublishGsConfig.
-	// So this test verifies that publishCommand works even when not connected
-	// (the actual check happens at a higher level).
-	client := &mockMQTTClientWriter{connected: false}
-	stats := newStatsTracker(false)
-
-	msg := &streaming.ToStarPassMessage{
-		StreamId: "stream-1",
-		PassId:   "plan-1",
-		Index:    1,
-	}
-
-	// publishCommand doesn't check connection, so this should succeed
-	err := publishCommand(client, "test/topic", 1, msg, stats, "uplink", 1)
-	if err != nil {
-		t.Errorf("publishCommand() error = %v (note: connection check is at higher level)", err)
-	}
+func TestPublishWhenNotConnectedIsRefused(t *testing.T) {
+	pub := newTestPublisher(t, &mockMQTTClientWriter{connected: false})
+	_, err := PublishSatCommand(pub, testUplinkTopic, "s", "p", 1, [][]byte{{0x01}})
+	require.Error(t, err)
+	_, err = PublishGsConfig(pub, testUplinkTopic, "s", "p", 1, &v1.GroundStationConfigurationRequest{})
+	require.Error(t, err)
+	assert.Empty(t, pub.stats.sentCommands, "a command that was never published is not recorded")
 }
 
-func TestPublishCommandTimeout(t *testing.T) {
-	client := &mockMQTTClientWriter{connected: true, pubErr: errors.New("timeout")}
-	stats := newStatsTracker(false)
-
-	msg := &streaming.ToStarPassMessage{
-		StreamId: "stream-1",
-		PassId:   "plan-1",
-		Index:    1,
-	}
-
-	err := publishCommand(client, "test/topic", 1, msg, stats, "uplink", 1)
-	if err == nil {
-		t.Error("publishCommand() should return error on timeout")
-	}
+// A failed publish is reported, and the command keeps its index: the broker
+// may still deliver it, so a copy under the same index would be refused.
+func TestPublishFailureIsReportedAndKeepsTheIndex(t *testing.T) {
+	pub := newTestPublisher(t, &mockMQTTClientWriter{connected: true, pubErr: errors.New("timeout")})
+	cmd, err := PublishSatCommand(pub, testUplinkTopic, "s", "p", 1, [][]byte{{0x01}})
+	require.ErrorContains(t, err, "command #1 was not confirmed by the broker")
+	require.NotNil(t, cmd)
+	assert.Len(t, pub.stats.sentCommands, 1)
 }
 
-func TestPublishSatCommand(t *testing.T) {
-	client := &mockMQTTClientWriter{connected: true}
-	stats := newStatsTracker(false)
-
-	commands := [][]byte{{0xde, 0xad, 0xbe, 0xef}}
-	err := PublishSatCommand(
-		t.Context(),
-		client,
-		"dev/pass-123/uplink",
-		"stream-1",
-		"plan-1",
-		1,
-		commands,
-		1,
-		stats,
-	)
-	if err != nil {
-		t.Fatalf("PublishSatCommand() error = %v", err)
-	}
-	if !client.published {
-		t.Error("Sat command should have been published")
-	}
-
-	// Verify the message was marshaled correctly
-	var msg streaming.ToStarPassMessage
-	if err := proto.Unmarshal(client.pubPayload, &msg); err != nil {
-		t.Fatalf("Failed to unmarshal published message: %v", err)
-	}
-	if msg.GetStreamId() != "stream-1" {
-		t.Errorf("StreamId = %v, want stream-1", msg.GetStreamId())
-	}
-	if msg.GetPassId() != "plan-1" {
-		t.Errorf("PlanId = %v, want plan-1", msg.GetPassId())
-	}
-	if msg.GetIndex() != 1 {
-		t.Errorf("Index = %v, want 1", msg.GetIndex())
-	}
+// A command is published once; the client never retries an unanswered one.
+func TestCommandIsPublishedOnce(t *testing.T) {
+	client := &recordingMQTTClient{mockMQTTClient: mockMQTTClient{connected: true}}
+	pub := newTestPublisher(t, client)
+	publishTestCommand(t, pub)
+	assert.Never(t, func() bool { return client.publishCount() != 1 }, 50*time.Millisecond, time.Millisecond)
+	assert.Len(t, pub.stats.sentCommands, 1)
 }
 
-func TestPublishSatCommandNotConnected(t *testing.T) {
-	client := &mockMQTTClientWriter{connected: false}
-	stats := newStatsTracker(false)
-
-	commands := [][]byte{{0xde, 0xad, 0xbe, 0xef}}
-	err := PublishSatCommand(
-		t.Context(),
-		client,
-		"dev/pass-123/uplink",
-		"stream-1",
-		"plan-1",
-		1,
-		commands,
-		1,
-		stats,
-	)
-	if err == nil {
-		t.Error("PublishSatCommand() should return error when client not connected")
-	}
+// publishTestCommand publishes command #1 on pub and returns it.
+func publishTestCommand(t *testing.T, pub *commandPublisher) *sentCommand {
+	t.Helper()
+	cmd, err := PublishSatCommand(pub, testUplinkTopic, "stream-1", "plan-1", 1, [][]byte{{0x0A, 0x1B}})
+	require.NoError(t, err)
+	return cmd
 }
 
-func TestPublishGsConfig(t *testing.T) {
-	client := &mockMQTTClientWriter{connected: true}
-	stats := newStatsTracker(false)
-
-	configRequest := &v1.GroundStationConfigurationRequest{}
-	err := PublishGsConfig(
-		t.Context(),
-		client,
-		"dev/pass-123/config_request",
-		"stream-1",
-		"plan-1",
-		1,
-		configRequest,
-		1,
-		stats,
-	)
-	if err != nil {
-		t.Fatalf("PublishGsConfig() error = %v", err)
-	}
-	if !client.published {
-		t.Error("GS config should have been published")
-	}
-
-	// Verify the message was marshaled correctly
-	var msg streaming.ToStarPassMessage
-	if err := proto.Unmarshal(client.pubPayload, &msg); err != nil {
-		t.Fatalf("Failed to unmarshal published message: %v", err)
-	}
-	if msg.GetStreamId() != "stream-1" {
-		t.Errorf("StreamId = %v, want stream-1", msg.GetStreamId())
-	}
-	if msg.GetPassId() != "plan-1" {
-		t.Errorf("PlanId = %v, want plan-1", msg.GetPassId())
-	}
-	if msg.GetIndex() != 1 {
-		t.Errorf("Index = %v, want 1", msg.GetIndex())
-	}
-}
-
-func TestPublishGsConfigNotConnected(t *testing.T) {
-	client := &mockMQTTClientWriter{connected: false}
-	stats := newStatsTracker(false)
-
-	configRequest := &v1.GroundStationConfigurationRequest{}
-	err := PublishGsConfig(
-		t.Context(),
-		client,
-		"dev/pass-123/config_request",
-		"stream-1",
-		"plan-1",
-		1,
-		configRequest,
-		1,
-		stats,
-	)
-	if err == nil {
-		t.Error("PublishGsConfig() should return error when client not connected")
-	}
+// testAck builds an Ack payload answering cmd.
+func testAck(t *testing.T, cmd *sentCommand, status streaming.Ack_Status, reasonCode string) []byte {
+	t.Helper()
+	payload, err := proto.Marshal(&streaming.Ack{
+		AckedMessageId: cmd.messageID,
+		MessageId:      "ack-" + reasonCode,
+		Status:         status,
+		Index:          uint64(cmd.index),
+		ReasonCode:     reasonCode,
+	})
+	require.NoError(t, err)
+	return payload
 }

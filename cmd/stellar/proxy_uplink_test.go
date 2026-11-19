@@ -1,11 +1,14 @@
 package main
 
 import (
+	"errors"
 	"sync"
 	"testing"
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 
 	streaming "github.com/infostellarinc/stellarstation-cli/gen/pb/stellarstation/satellitestreamer"
@@ -41,22 +44,21 @@ func (r *recordingMQTTClient) publishCount() int {
 	return len(r.payloads)
 }
 
-func newTestProxyUplinkSender(client mqtt.Client, window passWindow) *proxyUplinkSender {
+func newTestProxyUplinkSender(t *testing.T, client mqtt.Client, window passWindow) *proxyUplinkSender {
+	t.Helper()
+	pub := newCommandPublisher(client, 1, newStatsTracker(false), window)
 	return &proxyUplinkSender{
-		client:   client,
+		pub:      pub,
 		topic:    "dev/pass/p1/channel/c1/uplink",
 		streamID: "stream-1",
 		planID:   "plan-1",
-		qos:      1,
-		stats:    newStatsTracker(false),
-		window:   window,
 		index:    1,
 	}
 }
 
 func TestProxyUplinkSenderTransmitsInOrder(t *testing.T) {
 	client := &recordingMQTTClient{mockMQTTClient: mockMQTTClient{connected: true}}
-	s := newTestProxyUplinkSender(client, passWindow{})
+	s := newTestProxyUplinkSender(t, client, passWindow{})
 
 	s.send([]byte{0x0A, 0x1B})
 	s.send([]byte{0x2C, 0x3D, 0x4E})
@@ -92,7 +94,7 @@ func TestProxyUplinkSenderDropsOutsideBookingWindow(t *testing.T) {
 		start: time.Now().Add(-2 * time.Hour),
 		stop:  time.Now().Add(-1 * time.Hour),
 	}
-	s := newTestProxyUplinkSender(client, closed)
+	s := newTestProxyUplinkSender(t, client, closed)
 
 	s.send([]byte{0x01})
 
@@ -106,7 +108,7 @@ func TestProxyUplinkSenderDropsOutsideBookingWindow(t *testing.T) {
 
 func TestProxyUplinkSenderIgnoresEmptyPayload(t *testing.T) {
 	client := &recordingMQTTClient{mockMQTTClient: mockMQTTClient{connected: true}}
-	s := newTestProxyUplinkSender(client, passWindow{})
+	s := newTestProxyUplinkSender(t, client, passWindow{})
 
 	s.send(nil)
 	s.send([]byte{})
@@ -129,4 +131,33 @@ func TestBuildProxyUplinkFuncWithoutCredentialsDegradesToDrop(t *testing.T) {
 		t.Fatal("expected a drop-and-warn uplink callback")
 	}
 	fn([]byte{0x01}) // must not panic
+}
+
+// Each payload is published exactly once, under its own index, and closing
+// the sender publishes nothing more.
+func TestProxyUplinkSenderPublishesEachPayloadOnce(t *testing.T) {
+	client := &recordingMQTTClient{mockMQTTClient: mockMQTTClient{connected: true}}
+	pub := newCommandPublisher(client, 1, newStatsTracker(false), passWindow{})
+	s := &proxyUplinkSender{pub: pub, topic: testUplinkTopic, streamID: "stream-1", planID: "plan-1", index: 1}
+
+	s.send([]byte{0x0A})
+	s.send([]byte{0x0B})
+	s.close()
+	assert.Never(t, func() bool { return client.publishCount() != 2 }, 50*time.Millisecond, time.Millisecond)
+	require.Len(t, pub.stats.sentCommands, 2)
+	assert.Equal(t, uint32(1), pub.stats.sentCommands[0].index)
+	assert.Equal(t, uint32(2), pub.stats.sentCommands[1].index)
+}
+
+// An unconfirmed publish keeps its index, so the next payload takes the
+// following one rather than a possibly delivered index.
+func TestProxyUplinkSenderKeepsTheIndexOfAnUnconfirmedPublish(t *testing.T) {
+	pub := newTestPublisher(t, &mockMQTTClientWriter{connected: true, pubErr: errors.New("timeout")})
+	s := &proxyUplinkSender{pub: pub, topic: testUplinkTopic, streamID: "stream-1", planID: "plan-1", index: 1}
+
+	s.send([]byte{0x0A})
+	s.send([]byte{0x0B})
+	require.Len(t, pub.stats.sentCommands, 2)
+	assert.Equal(t, uint32(1), pub.stats.sentCommands[0].index)
+	assert.Equal(t, uint32(2), pub.stats.sentCommands[1].index)
 }

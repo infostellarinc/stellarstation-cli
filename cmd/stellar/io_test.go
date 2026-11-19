@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // UUID-form fixtures: buildChunkFilePath and writeNonTelemetryMessage refuse
@@ -108,6 +109,7 @@ func TestWriteChunkToFile(t *testing.T) {
 		stats,
 		cfg.WriteInOrder,
 		cfg,
+		time.Time{},
 	)
 	if err != nil {
 		t.Fatalf("writeChunkToFile() error = %v", err)
@@ -170,6 +172,7 @@ func TestWriteChunkToFileWithStdout(t *testing.T) {
 		stats,
 		cfg.WriteInOrder,
 		cfg,
+		time.Time{},
 	)
 	if err != nil {
 		t.Fatalf("writeChunkToFile() error = %v", err)
@@ -209,6 +212,7 @@ func TestWriteChunkToFileWithOutputFile(t *testing.T) {
 		stats,
 		cfg.WriteInOrder,
 		cfg,
+		time.Time{},
 	)
 	if err != nil {
 		t.Fatalf("writeChunkToFile() error = %v", err)
@@ -254,6 +258,7 @@ func TestWriteChunkToFileWithUnknownFraming(t *testing.T) {
 		stats,
 		cfg.WriteInOrder,
 		cfg,
+		time.Time{},
 	)
 	if err != nil {
 		t.Fatalf("writeChunkToFile() error = %v", err)

@@ -28,7 +28,7 @@ func cliVersion() string {
 }
 
 // NewRootCommand creates the top-level "stellar" command and registers all
-// subcommand trees (satellite, auth, version).
+// subcommand trees (satellite, ticket, auth, version).
 // Global --api-url and --credentials flags are registered here so every
 // subcommand inherits them.
 func NewRootCommand() *cobra.Command {
@@ -38,7 +38,11 @@ func NewRootCommand() *cobra.Command {
 		Long: `StellarStation command-line tool for satellite operators.
 
 Use it to list pass opportunities, book and manage passes, stream telemetry
-live, send commands, and manage orbit data (TLE).
+live, send commands, manage orbit data (TLE), and raise tickets about problems.
+
+New here? Run "stellar interactive" (or just "stellar" in a terminal) for a
+step-by-step session that sets up your key and walks through booking and
+streaming passes.
 
 Getting started:
   1. Activate your API key (once):   stellar auth activate-api-key <key-file>
@@ -50,13 +54,24 @@ Run "stellar <command> --help" on any command for details and examples.`,
 		// We print errors ourselves (see main.go) so they are not shown twice.
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		Args:          cobra.NoArgs,
+		// Bare "stellar" in a terminal starts interactive mode; anywhere else (scripts,
+		// pipes) it prints the help as before.
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if isInteractiveTerminal() {
+				return runInteractive(cmd, teaPrompter{}, cmd.OutOrStdout())
+			}
+			return cmd.Help()
+		},
 	}
 
 	addAPIFlags(cmd)
 
 	cmd.AddCommand(
 		newSatelliteCommand(),
+		newTicketCommand(),
 		newAuthCommand(),
+		newInteractiveCommand(),
 		newVersionCommand(),
 	)
 

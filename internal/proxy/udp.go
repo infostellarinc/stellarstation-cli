@@ -33,7 +33,13 @@ type UDPProxy struct {
 
 	closeCh   chan struct{}
 	closeOnce sync.Once
-	wg        sync.WaitGroup
+
+	// mu guards started. The loops are counted in wg while mu is held, so
+	// Close only waits once Start has registered them: a WaitGroup must not
+	// be added to while another goroutine waits on it at zero.
+	mu      sync.Mutex
+	started bool
+	wg      sync.WaitGroup
 }
 
 // NewUDP creates a UDP proxy. It immediately binds the listen and send sockets.
@@ -65,7 +71,14 @@ func (p *UDPProxy) Start() error {
 	log.Printf("UDP proxy started: uplink listen=%s, downlink send=%s",
 		p.recvConn.LocalAddr(), p.sendConn.RemoteAddr())
 
+	p.mu.Lock()
+	if p.started {
+		p.mu.Unlock()
+		return errors.New("UDP proxy already started")
+	}
+	p.started = true
 	p.wg.Add(2)
+	p.mu.Unlock()
 	go p.sendLoop()
 	go p.recvLoop()
 	p.wg.Wait()
@@ -77,7 +90,12 @@ func (p *UDPProxy) Close() error {
 	p.closeOnce.Do(func() { close(p.closeCh) })
 	_ = p.recvConn.Close()
 	_ = p.sendConn.Close()
-	p.wg.Wait()
+	p.mu.Lock()
+	started := p.started
+	p.mu.Unlock()
+	if started {
+		p.wg.Wait()
+	}
 	return nil
 }
 

@@ -35,7 +35,12 @@ type TCPProxy struct {
 
 	closeCh   chan struct{}
 	closeOnce sync.Once
-	wg        sync.WaitGroup
+
+	// started is guarded by mu. The loops are counted in wg while mu is
+	// held, so Close only waits once Start has registered them: a WaitGroup
+	// must not be added to while another goroutine waits on it at zero.
+	started bool
+	wg      sync.WaitGroup
 }
 
 // NewTCP creates a TCP proxy. It immediately binds the listen socket.
@@ -58,7 +63,14 @@ func NewTCP(ctx context.Context, cfg TCPConfig, downlinkCh <-chan []byte, uplink
 func (p *TCPProxy) Start() error {
 	log.Printf("TCP proxy started: listen=%s", p.listener.Addr())
 
+	p.mu.Lock()
+	if p.started {
+		p.mu.Unlock()
+		return errors.New("TCP proxy already started")
+	}
+	p.started = true
 	p.wg.Add(2)
+	p.mu.Unlock()
 	go p.acceptLoop()
 	go p.fanOutLoop()
 	p.wg.Wait()
@@ -74,9 +86,12 @@ func (p *TCPProxy) Close() error {
 	for c := range p.conns {
 		_ = c.Close()
 	}
+	started := p.started
 	p.mu.Unlock()
 
-	p.wg.Wait()
+	if started {
+		p.wg.Wait()
+	}
 	return nil
 }
 

@@ -55,13 +55,19 @@ Defaults to the next 7 days when --start/--stop are omitted.
 Examples:
   stellar satellite list-visibilities --satellite-id <id>
   stellar satellite list-visibilities --satellite-id <id> \
-      --start 2026-01-15T00:00:00Z --stop 2026-01-16T00:00:00Z`,
+      --start 2026-01-15T00:00:00Z --stop 2026-01-16T00:00:00Z
+  stellar satellite list-visibilities --satellite-id <id> \
+      --ground-station-id <id> --min-max-elevation 10`,
 		RunE: runListVisibilities,
 	}
 	addOutputFlag(cmd)
 	cmd.Flags().StringSlice("satellite-id", nil, "Which satellite to check (required; from list-satellites)")
 	cmd.Flags().String("start", "", "Earliest time to look from, e.g. 2026-01-15T10:00:00Z (default: now)")
 	cmd.Flags().String("stop", "", "Latest time to look until, e.g. 2026-01-22T10:00:00Z (default: 7 days after start)")
+	cmd.Flags().
+		StringSlice("ground-station-id", nil, "Only show opportunities on these ground stations (default: all you can read)")
+	cmd.Flags().
+		Float64("min-max-elevation", 0, "Only show opportunities whose max elevation is at least this many degrees")
 	_ = cmd.MarkFlagRequired("satellite-id")
 	return cmd
 }
@@ -77,6 +83,12 @@ func runListVisibilities(cmd *cobra.Command, _ []string) error {
 	}
 
 	satIDs, _ := cmd.Flags().GetStringSlice("satellite-id")
+	gsIDs, _ := cmd.Flags().GetStringSlice("ground-station-id")
+	var minMaxElevation *float64
+	if cmd.Flags().Changed("min-max-elevation") {
+		v, _ := cmd.Flags().GetFloat64("min-max-elevation")
+		minMaxElevation = &v
+	}
 
 	start, stop, err := resolveListWindow(cmd, time.Now().UTC())
 	if err != nil {
@@ -84,9 +96,11 @@ func runListVisibilities(cmd *cobra.Command, _ []string) error {
 	}
 
 	visibilities, err := client.ListVisibilities(cmd.Context(), apiclient.ListVisibilitiesOpts{
-		SatelliteIDs: satIDs,
-		Start:        start,
-		Stop:         stop,
+		SatelliteIDs:           satIDs,
+		GroundStationIDs:       gsIDs,
+		Start:                  start,
+		Stop:                   stop,
+		MinMaxElevationDegrees: minMaxElevation,
 	})
 	if err != nil {
 		return err

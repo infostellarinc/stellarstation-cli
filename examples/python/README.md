@@ -59,7 +59,7 @@ next one uses. Every script accepts `--help`.
 | `reserve_and_cancel_pass.py` | Reserves the next available pass, reads it back, then cancels it to clean up |
 | `list_passes.py` | Lists your reserved and executed passes |
 | `stream_telemetry.py` | Receives telemetry live while a pass executes |
-| `send_command.py` | Sends one command to the satellite during a pass and waits for the acknowledgment |
+| `send_command.py` | Sends one command to the satellite during a pass, waits for the acknowledgment, then waits for the delivery status, for example the time it was radiated |
 | `download_telemetry.py` | Downloads the telemetry received during a pass, live or afterwards |
 | `get_orbit_data.py` | Shows a satellite's active orbit data, source, and activation history |
 | `add_orbit_data.py` | Uploads a TLE for a satellite |
@@ -86,6 +86,18 @@ the pass topics.
   channel's rate class. Low rate channels stream live over the broker
   (`stream_telemetry.py`, `send_command.py`); high rate channels are served
   from storage (`download_telemetry.py`).
+- `send_command.py` sends the command once and never retries it: a retry
+  during a pass only adds to the congestion that lost the first copy. Without
+  an acknowledgment it exits 3, and the command may still have arrived. Running
+  the script again sends a new command, which is transmitted again. Where the ground station
+  reports delivery status (the acknowledgment's `expected_final_stage` is set),
+  the script then waits on the status topic for the command's final status.
+  It exits with 0 when the command was acknowledged and delivered, 1 when it
+  was refused, failed or not transmitted, and 3 when the outcome is unknown:
+  check spacecraft telemetry before sending the command again.
+- `python3 -m unittest test_commanding.py` checks the command encoding, the
+  acknowledgment and status decoding, and the acknowledgment and status waits without connecting
+  to anything.
 - The streaming examples cover receiving telemetry and sending commands. They
   are passive consumers otherwise: they do not publish acknowledgments,
   recover dropped connections, or send ground station configuration requests.

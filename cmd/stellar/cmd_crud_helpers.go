@@ -43,12 +43,22 @@ func addOutputFlag(cmd *cobra.Command) {
 	cmd.Flags().StringP("output", "o", "wide", "How to show results: wide (readable table, default), csv, or json")
 }
 
+// bearerTokenEnv names a ready-made bearer token that is sent as is instead
+// of a token minted from the API key. A Cognito user token placed here lets a
+// person act as themselves, which ticket actions such as raising and
+// commenting require, since an API key carries no user.
+const bearerTokenEnv = "STELLAR_BEARER_TOKEN"
+
 // newTokenSource resolves credentials from --credentials / $STELLAR_CREDENTIALS
 // / the default ~/.stellarstation/credentials.json location and returns an
 // OAuth2 token source that the caller can hand to apiclient.New and
 // fetchAuthorizerCredentials. The resolved path is returned so callers can
-// include it in error messages.
+// include it in error messages. A token in $STELLAR_BEARER_TOKEN takes
+// precedence over the key file, which then need not exist.
 func newTokenSource(cmd *cobra.Command) (auth.TokenSource, string, error) {
+	if token := strings.TrimSpace(os.Getenv(bearerTokenEnv)); token != "" {
+		return auth.StaticTokenSource{Value: token}, "$" + bearerTokenEnv, nil
+	}
 	path, err := resolveCredentialsPath(cmd)
 	if err != nil {
 		return nil, "", err
@@ -89,6 +99,20 @@ func resolveCredentialsPath(cmd *cobra.Command) (string, error) {
 	return auth.DefaultCredentialsPath()
 }
 
+// rememberedAPIURL is the API address saved with the activated API key by
+// `stellar interactive`, if any.
+func rememberedAPIURL(cmd *cobra.Command) string {
+	path, err := resolveCredentialsPath(cmd)
+	if err != nil {
+		return ""
+	}
+	creds, err := auth.Load(path)
+	if err != nil {
+		return ""
+	}
+	return creds.APIURL
+}
+
 // resolveAPIBaseURL returns the base URL used for REST and authorizer HTTP
 // calls. If the user did not override --api-url, STELLAR_API_URL is applied so
 // dev shells can point at their environment without repeating the flag.
@@ -103,8 +127,12 @@ func resolveAPIBaseURL(cmd *cobra.Command) (string, error) {
 		apiURL, _ = cmd.Flags().GetString("api-url")
 	}
 	if strings.TrimSpace(apiURL) == "" {
+		apiURL = rememberedAPIURL(cmd)
+	}
+	if strings.TrimSpace(apiURL) == "" {
 		return "", errors.New(
-			"no API address configured: set the STELLAR_API_URL environment variable or pass --api-url")
+			"no API address configured: run \"stellar interactive\", set the STELLAR_API_URL environment variable, " +
+				"or pass --api-url")
 	}
 	apiURL = strings.TrimRight(strings.TrimSpace(apiURL), "/")
 

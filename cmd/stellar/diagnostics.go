@@ -122,34 +122,42 @@ type AckStats struct {
 
 // CommandStats contains command sending statistics
 type CommandStats struct {
-	UplinkStats        UplinkStats        `json:"uplinks"`
-	ConfigRequestStats ConfigRequestStats `json:"config_requests"`
+	UplinkStats        CommandKindStats `json:"uplinks"`
+	ConfigRequestStats CommandKindStats `json:"config_requests"`
 }
 
-// UplinkStats contains satellite command statistics
-type UplinkStats struct {
+// CommandKindStats summarises the satellite commands or the ground station
+// config requests.
+type CommandKindStats struct {
 	TotalSent int             `json:"total_sent"`
 	Acked     int             `json:"acked"`
 	Rejected  int             `json:"rejected"`
 	Unacked   int             `json:"unacked"`
+	Radiated  int             `json:"radiated"`
+	Applied   int             `json:"applied"`
+	Partial   int             `json:"partially_applied"`
+	Failed    int             `json:"failed"`
+	Unknown   int             `json:"unknown"`
+	Late      int             `json:"late"`
 	Commands  []CommandDetail `json:"commands"`
 }
 
-// ConfigRequestStats contains ground station config statistics
-type ConfigRequestStats struct {
-	TotalSent int             `json:"total_sent"`
-	Acked     int             `json:"acked"`
-	Rejected  int             `json:"rejected"`
-	Unacked   int             `json:"unacked"`
-	Commands  []CommandDetail `json:"commands"`
-}
-
-// CommandDetail contains details about a single command
+// CommandDetail contains details about a single command and what the ground
+// station reported about it.
 type CommandDetail struct {
-	Index     uint32 `json:"index"`
-	Timestamp string `json:"timestamp"`
-	Acked     bool   `json:"acked"`
-	Rejected  bool   `json:"rejected"`
+	Index          uint32 `json:"index"`
+	MessageID      string `json:"message_id,omitempty"`
+	Timestamp      string `json:"timestamp"`
+	Acked          bool   `json:"acked"`
+	Rejected       bool   `json:"rejected"`
+	NackReasonCode string `json:"nack_reason_code,omitempty"`
+	Stage          string `json:"stage,omitempty"`
+	Outcome        string `json:"outcome,omitempty"`
+	Skipped        bool   `json:"skipped,omitempty"`
+	RadiatedAt     string `json:"radiated_at,omitempty"`
+	Failure        string `json:"failure,omitempty"`
+	ProviderCode   string `json:"provider_code,omitempty"`
+	Reason         string `json:"reason,omitempty"`
 }
 
 // ChannelStatistics contains per-channel statistics
@@ -285,45 +293,62 @@ func getErrors(stats *statsTracker) []string {
 }
 
 func buildCommandStats(stats *statsTracker) CommandStats {
-	allSentCommands := stats.GetAllSentCommands()
-	uplinkStats := UplinkStats{Commands: make([]CommandDetail, 0)}
-	configRequestStats := ConfigRequestStats{Commands: make([]CommandDetail, 0)}
-	for _, cmd := range allSentCommands {
-		cmdDetail := CommandDetail{
-			Index:     cmd.index,
-			Timestamp: formatUTCTimestamp(time.Unix(0, cmd.timestamp)),
-			Acked:     cmd.acked,
-			Rejected:  cmd.rejected,
-		}
-		switch cmd.cmdType {
-		case "uplink":
-			uplinkStats.TotalSent++
-			switch {
-			case cmd.acked:
-				uplinkStats.Acked++
-			case cmd.rejected:
-				uplinkStats.Rejected++
-			default:
-				uplinkStats.Unacked++
-			}
-			uplinkStats.Commands = append(uplinkStats.Commands, cmdDetail)
-		case "config_request":
-			configRequestStats.TotalSent++
-			switch {
-			case cmd.acked:
-				configRequestStats.Acked++
-			case cmd.rejected:
-				configRequestStats.Rejected++
-			default:
-				configRequestStats.Unacked++
-			}
-			configRequestStats.Commands = append(configRequestStats.Commands, cmdDetail)
-		}
+	byKind := map[string][]sentCommand{}
+	for _, cmd := range stats.commandSnapshots() {
+		byKind[cmd.cmdType] = append(byKind[cmd.cmdType], cmd)
 	}
 	return CommandStats{
-		UplinkStats:        uplinkStats,
-		ConfigRequestStats: configRequestStats,
+		UplinkStats:        buildCommandKindStats(byKind[cmdTypeUplink]),
+		ConfigRequestStats: buildCommandKindStats(byKind[cmdTypeConfigRequest]),
 	}
+}
+
+func buildCommandKindStats(cmds []sentCommand) CommandKindStats {
+	n := countDeliveries(cmds)
+	out := CommandKindStats{
+		TotalSent: len(cmds),
+		Radiated:  n.radiated,
+		Applied:   n.applied,
+		Partial:   n.partial,
+		Failed:    n.failed,
+		Unknown:   n.unknown,
+		Late:      n.late,
+		Commands:  make([]CommandDetail, 0, len(cmds)),
+	}
+	for _, cmd := range cmds {
+		switch {
+		case cmd.acked:
+			out.Acked++
+		case cmd.rejected:
+			out.Rejected++
+		default:
+			out.Unacked++
+		}
+		out.Commands = append(out.Commands, commandDetail(cmd))
+	}
+	return out
+}
+
+func commandDetail(cmd sentCommand) CommandDetail {
+	d := cmd.delivery
+	detail := CommandDetail{
+		Index:          cmd.index,
+		MessageID:      cmd.messageID,
+		Timestamp:      formatUTCTimestamp(time.Unix(0, cmd.timestamp)),
+		Acked:          cmd.acked,
+		Rejected:       cmd.rejected,
+		NackReasonCode: cmd.nackReasonCode,
+		Stage:          stageName(d.stage),
+		Outcome:        outcomeName(d.outcome),
+		Skipped:        d.skipped,
+		Failure:        failureName(d.failure),
+		ProviderCode:   d.providerCode,
+		Reason:         d.reason,
+	}
+	if !d.radiatedAt.IsZero() {
+		detail.RadiatedAt = formatUTCTimestamp(d.radiatedAt)
+	}
+	return detail
 }
 
 func buildDiagnosticsData(

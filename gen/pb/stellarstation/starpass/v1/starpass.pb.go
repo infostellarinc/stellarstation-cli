@@ -21,12 +21,12 @@
 package starpassv1
 
 import (
-	radio "github.com/infostellarinc/stellarstation-cli/gen/pb/stellarstation/starpass/v1/radio"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
 	wrapperspb "google.golang.org/protobuf/types/known/wrapperspb"
 	reflect "reflect"
+	radio "github.com/infostellarinc/stellarstation-cli/gen/pb/stellarstation/starpass/v1/radio"
 	sync "sync"
 	unsafe "unsafe"
 )

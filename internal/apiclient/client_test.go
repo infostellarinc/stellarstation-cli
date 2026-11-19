@@ -100,7 +100,7 @@ func TestCreatePass(t *testing.T) {
 			t.Errorf("method = %s, want POST", r.Method)
 		}
 		assertBearer(t, r)
-		var req PassCreateRequest
+		var req CreatePassRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		if req.SatelliteID != "sat-1" {
 			t.Errorf("SatelliteID = %q, want sat-1", req.SatelliteID)
@@ -111,7 +111,7 @@ func TestCreatePass(t *testing.T) {
 
 	c := New(srv.URL, staticToken())
 	now := time.Now().Truncate(time.Second)
-	got, err := c.CreatePass(context.Background(), PassCreateRequest{
+	got, err := c.CreatePass(context.Background(), CreatePassRequest{
 		SatelliteID: "sat-1",
 		Booking:     Interval{Start: now, Stop: now.Add(time.Hour)},
 		Scheduled:   Interval{Start: now, Stop: now.Add(time.Hour)},
@@ -172,6 +172,51 @@ func TestListVisibilities(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].Satellite.ID != "sat-1" {
 		t.Errorf("visibilities = %+v, want 1 for sat-1", got)
+	}
+}
+
+func TestListVisibilities_GroundStationAndMinMaxElevationFilters(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		if got := q.Get("ground_station_ids"); got != "gs-1,gs-2" {
+			t.Errorf("ground_station_ids = %q, want gs-1,gs-2", got)
+		}
+		if got := q.Get("min_max_elevation_degrees"); got != "12.5" {
+			t.Errorf("min_max_elevation_degrees = %q, want 12.5", got)
+		}
+		_ = json.NewEncoder(w).Encode([]Visibility{})
+	}))
+	defer srv.Close()
+
+	minElevation := 12.5
+	c := New(srv.URL, staticToken())
+	if _, err := c.ListVisibilities(context.Background(), ListVisibilitiesOpts{
+		SatelliteIDs:           []string{"sat-1"},
+		GroundStationIDs:       []string{"gs-1", "gs-2"},
+		MinMaxElevationDegrees: &minElevation,
+	}); err != nil {
+		t.Fatalf("ListVisibilities: %v", err)
+	}
+}
+
+func TestListVisibilities_OmitsUnsetFilters(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		for _, key := range []string{"ground_station_ids", "min_max_elevation_degrees"} {
+			if q.Has(key) {
+				t.Errorf("query has %q = %q, want omitted", key, q.Get(key))
+			}
+		}
+		_ = json.NewEncoder(w).Encode([]Visibility{})
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, staticToken())
+	if _, err := c.ListVisibilities(
+		context.Background(),
+		ListVisibilitiesOpts{SatelliteIDs: []string{"sat-1"}},
+	); err != nil {
+		t.Fatalf("ListVisibilities: %v", err)
 	}
 }
 
@@ -308,7 +353,7 @@ func TestUpdateOrbitParameters(t *testing.T) {
 
 	c := New(srv.URL, staticToken())
 	got, err := c.UpdateOrbitParameters(context.Background(), "sat-1",
-		OrbitParametersUpdateRequest{OrbitalDataSource: "manual"})
+		UpdateOrbitParametersRequest{OrbitalDataSource: "manual"})
 	if err != nil {
 		t.Fatalf("UpdateOrbitParameters: %v", err)
 	}

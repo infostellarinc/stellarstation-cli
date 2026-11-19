@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -129,7 +130,7 @@ func TestRunCredentialRefresher_RefreshesBeforeExpiry(t *testing.T) {
 	defer cancel()
 
 	authReq := AuthorizerRequest{PassID: "pass-1", EnableDownlink: true}
-	go runCredentialRefresher(ctx, cs, srv.URL, refresherTestTokenSource(), authReq)
+	go runCredentialRefresher(ctx, newStreamRevocationWatch(srv.URL, refresherTestTokenSource(), authReq, cs, nil))
 
 	// Wait until the store is updated with the refreshed credentials.
 	deadline := time.Now().Add(4 * time.Second)
@@ -155,7 +156,7 @@ func TestRunCredentialRefresher_StopsOnContextCancel(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		runCredentialRefresher(ctx, cs, "http://unused", refresherTestTokenSource(), AuthorizerRequest{})
+		runCredentialRefresher(ctx, newStreamRevocationWatch("http://unused", refresherTestTokenSource(), AuthorizerRequest{}, cs, nil))
 		close(done)
 	}()
 
@@ -202,7 +203,7 @@ func TestRunCredentialRefresher_RetriesOnError(t *testing.T) {
 	defer cancel()
 
 	authReq := AuthorizerRequest{PassID: "pass-1"}
-	go runCredentialRefresher(ctx, cs, srv.URL, refresherTestTokenSource(), authReq)
+	go runCredentialRefresher(ctx, newStreamRevocationWatch(srv.URL, refresherTestTokenSource(), authReq, cs, nil))
 
 	deadline := time.Now().Add(38 * time.Second)
 	for time.Now().Before(deadline) {
@@ -215,4 +216,37 @@ func TestRunCredentialRefresher_RetriesOnError(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 	}
 	t.Fatalf("credentials were not refreshed after retry; callCount=%d", callCount)
+}
+
+// A revoked stream is never authorized again, so the refresher stops instead
+// of retrying.
+func TestRunCredentialRefresher_StopsWhenRevoked(t *testing.T) {
+	cs := newCredentialStore(makeTestCreds(time.Now().Add(2 * time.Minute)))
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":"stream_revoked","message":"this stream was revoked; open a new stream instead"}`))
+	}))
+	defer srv.Close()
+
+	var told []string
+	watch := newStreamRevocationWatch(srv.URL, refresherTestTokenSource(), AuthorizerRequest{PassID: "pass-1"}, cs,
+		func(detail string) { told = append(told, detail) })
+	done := make(chan struct{})
+	go func() {
+		runCredentialRefresher(t.Context(), watch)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the refresher kept retrying a revoked stream")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("authorizer called %d times, want once", got)
+	}
+	if len(told) != 1 || told[0] != "this stream was revoked; open a new stream instead" {
+		t.Errorf("operator told %q, want the authorizer's explanation once", told)
+	}
 }

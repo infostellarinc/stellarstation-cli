@@ -94,6 +94,16 @@ func TestTopicFormats(t *testing.T) {
 			want: "dev/pass/p1/channel/c1/config_request/ack",
 		},
 		{
+			name: "uplink status",
+			got:  StatusTopic(UplinkTopic(env, passID, channel)),
+			want: "dev/pass/p1/channel/c1/uplink/status",
+		},
+		{
+			name: "config request status",
+			got:  StatusTopic(ConfigRequestTopic(env, passID, channel)),
+			want: "dev/pass/p1/channel/c1/config_request/status",
+		},
+		{
 			name: "telemetry ack",
 			got:  AckTopic(TelemetryTopic(env, passID, channel, "BITSTREAM")),
 			want: "dev/pass/p1/channel/c1/downlink/BITSTREAM/ack",

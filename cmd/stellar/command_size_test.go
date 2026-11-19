@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"strings"
 	"testing"
 
@@ -52,16 +51,13 @@ func TestValidateCommandSize(t *testing.T) {
 func TestMaxCommandFitsPayloadLimit(t *testing.T) {
 	client := &mockMQTTClientWriter{connected: true}
 
-	err := PublishSatCommand(
-		t.Context(),
-		client,
+	_, err := PublishSatCommand(
+		newTestPublisher(t, client),
 		"dev/pass-123/uplink",
 		uuidLikeID,
 		uuidLikeID,
 		1,
 		[][]byte{make([]byte, maxCommandBytes)},
-		1,
-		newStatsTracker(false),
 	)
 	if err != nil {
 		t.Fatalf("PublishSatCommand() error = %v", err)
@@ -80,16 +76,13 @@ func TestCommandIsNotRepeatedInEnvelope(t *testing.T) {
 	const cmdLen = 4096
 	client := &mockMQTTClientWriter{connected: true}
 
-	err := PublishSatCommand(
-		t.Context(),
-		client,
+	_, err := PublishSatCommand(
+		newTestPublisher(t, client),
 		"dev/pass-123/uplink",
 		uuidLikeID,
 		uuidLikeID,
 		1,
 		[][]byte{make([]byte, cmdLen)},
-		1,
-		newStatsTracker(false),
 	)
 	if err != nil {
 		t.Fatalf("PublishSatCommand() error = %v", err)
@@ -102,16 +95,13 @@ func TestCommandIsNotRepeatedInEnvelope(t *testing.T) {
 func TestPublishSatCommandRejectsOversized(t *testing.T) {
 	client := &mockMQTTClientWriter{connected: true}
 
-	err := PublishSatCommand(
-		t.Context(),
-		client,
+	_, err := PublishSatCommand(
+		newTestPublisher(t, client),
 		"dev/pass-123/uplink",
 		uuidLikeID,
 		uuidLikeID,
 		1,
 		[][]byte{make([]byte, maxCommandBytes+1)},
-		1,
-		newStatsTracker(false),
 	)
 	if err == nil {
 		t.Fatal("PublishSatCommand() should reject a command over the limit")
@@ -132,7 +122,8 @@ func TestPublishCommandRejectsOversizedMessage(t *testing.T) {
 		Command:  [][]byte{make([]byte, mqttMaxPayloadBytes)},
 	}
 
-	err := publishCommand(client, "dev/pass-123/uplink", 1, msg, nil, "uplink", 1)
+	pub := newTestPublisher(t, client)
+	_, err := pub.publishCommand("dev/pass-123/uplink", cmdTypeUplink, msg)
 	if err == nil {
 		t.Fatal("publishCommand() should reject a message over the limit")
 	}
@@ -158,17 +149,9 @@ func TestCommandScannerAcceptsLongestCommandLine(t *testing.T) {
 // The one-shot sender rejects an oversized command before it is published.
 func TestCreateSendSatCommandFuncRejectsOversized(t *testing.T) {
 	client := &mockMQTTClient{connected: true}
-	sendFunc := createSendSatCommandFunc(
-		t.Context(),
-		client,
-		"dev/pass-123/uplink",
-		"stream-1",
-		"plan-1",
-		Config{MQTTQoS: 1},
-		newStatsTracker(false),
-	)
+	sendFunc := createSendSatCommandFunc(newTestPublisher(t, client), "dev/pass-123/uplink", "stream-1", "plan-1")
 
-	err := sendFunc(strings.Repeat("ab", maxCommandBytes+1), 1)
+	_, err := sendFunc(strings.Repeat("ab", maxCommandBytes+1), 1)
 	if err == nil {
 		t.Fatal("sendFunc() should reject a command over the limit")
 	}
@@ -185,7 +168,7 @@ func TestInteractiveSatCommandOverSizeLimit(t *testing.T) {
 	})
 
 	out := captureStderr(t, func() {
-		s.sendSatCommand(context.Background(), []string{strings.Repeat("ab", maxCommandBytes+1)})
+		s.sendSatCommand([]string{strings.Repeat("ab", maxCommandBytes+1)})
 	})
 
 	if !strings.Contains(out, "over the") {

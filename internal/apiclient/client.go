@@ -143,7 +143,7 @@ func (c *Client) ListPasses(ctx context.Context, opts ListPassesOpts) ([]Pass, e
 }
 
 // CreatePass calls POST /v1/passes.
-func (c *Client) CreatePass(ctx context.Context, req PassCreateRequest) (*Pass, error) {
+func (c *Client) CreatePass(ctx context.Context, req CreatePassRequest) (*Pass, error) {
 	var pass Pass
 	if err := c.doJSON(ctx, http.MethodPost, "/v1/passes", nil, req, &pass); err != nil {
 		return nil, err
@@ -169,8 +169,19 @@ func (c *Client) GetPass(ctx context.Context, passID string) (*Pass, error) {
 	return &pass, nil
 }
 
+// GetPassChannels returns the pass's channels, from GET /v1/passes/{passId}/view.
+func (c *Client) GetPassChannels(ctx context.Context, passID string) ([]PassChannel, error) {
+	var view struct {
+		Channels []PassChannel `json:"channels"`
+	}
+	if err := c.doJSON(ctx, http.MethodGet, "/v1/passes/"+passID+"/view", nil, nil, &view); err != nil {
+		return nil, err
+	}
+	return view.Channels, nil
+}
+
 // UpdatePass calls PUT /v1/passes/{passId}.
-func (c *Client) UpdatePass(ctx context.Context, passID string, req PassUpdateRequest) (*Pass, error) {
+func (c *Client) UpdatePass(ctx context.Context, passID string, req UpdatePassRequest) (*Pass, error) {
 	var pass Pass
 	if err := c.doJSON(ctx, http.MethodPut, "/v1/passes/"+passID, nil, req, &pass); err != nil {
 		return nil, err
@@ -187,11 +198,17 @@ func (c *Client) ListVisibilities(ctx context.Context, opts ListVisibilitiesOpts
 	if len(opts.SatelliteIDs) > 0 {
 		q.Set("satellite_ids", strings.Join(opts.SatelliteIDs, ","))
 	}
+	if len(opts.GroundStationIDs) > 0 {
+		q.Set("ground_station_ids", strings.Join(opts.GroundStationIDs, ","))
+	}
 	if opts.Start != nil {
 		q.Set("start", opts.Start.Format(time.RFC3339))
 	}
 	if opts.Stop != nil {
 		q.Set("stop", opts.Stop.Format(time.RFC3339))
+	}
+	if opts.MinMaxElevationDegrees != nil {
+		q.Set("min_max_elevation_degrees", strconv.FormatFloat(*opts.MinMaxElevationDegrees, 'f', -1, 64))
 	}
 
 	var visibilities []Visibility
@@ -229,7 +246,7 @@ func (c *Client) GetOrbitData(ctx context.Context, satelliteID string) (*OrbitDa
 func (c *Client) CreateOrbitData(
 	ctx context.Context,
 	satelliteID string,
-	req OrbitDataCreateRequest,
+	req CreateOrbitDataRequest,
 ) (*OrbitData, error) {
 	var data OrbitData
 	path := "/v1/satellites/" + satelliteID + "/orbit-data"
@@ -239,13 +256,40 @@ func (c *Client) CreateOrbitData(
 	return &data, nil
 }
 
+// ValidateOrbitData calls POST /v1/satellites/{id}/orbit-data/validate, which
+// checks and converts orbit data without storing it. A rejected upload is a
+// successful call whose result has Valid false.
+func (c *Client) ValidateOrbitData(
+	ctx context.Context,
+	satelliteID string,
+	req ValidateOrbitDataRequest,
+) (*OrbitValidationResult, error) {
+	var result OrbitValidationResult
+	path := "/v1/satellites/" + satelliteID + "/orbit-data/validate"
+	if err := c.doJSON(ctx, http.MethodPost, path, nil, req, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// GetOrbitDataUpload calls GET /v1/satellites/{id}/orbit-data/{orbitDataId}/upload,
+// the OMM, Keplerian elements or OEM an orbit-data version was converted from.
+func (c *Client) GetOrbitDataUpload(ctx context.Context, satelliteID, orbitDataID string) (*OrbitDataUpload, error) {
+	var upload OrbitDataUpload
+	path := "/v1/satellites/" + satelliteID + "/orbit-data/" + orbitDataID + "/upload"
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, nil, &upload); err != nil {
+		return nil, err
+	}
+	return &upload, nil
+}
+
 // ListOrbitHistory calls GET /v1/satellites/{id}/orbit-data/history and returns
 // the orbit-data activation history (newest first).
 func (c *Client) ListOrbitHistory(
 	ctx context.Context,
 	satelliteID string,
 	opts ListOrbitHistoryOpts,
-) (*OrbitHistoryResponse, error) {
+) (*ListOrbitDataResponse, error) {
 	q := url.Values{}
 	if opts.Limit > 0 {
 		q.Set("limit", strconv.Itoa(opts.Limit))
@@ -257,7 +301,7 @@ func (c *Client) ListOrbitHistory(
 		q.Set("source", opts.Source)
 	}
 
-	var resp OrbitHistoryResponse
+	var resp ListOrbitDataResponse
 	path := "/v1/satellites/" + satelliteID + "/orbit-data/history"
 	if err := c.doJSON(ctx, http.MethodGet, path, q, nil, &resp); err != nil {
 		return nil, err
@@ -279,7 +323,7 @@ func (c *Client) GetOrbitParameters(ctx context.Context, satelliteID string) (*O
 func (c *Client) UpdateOrbitParameters(
 	ctx context.Context,
 	satelliteID string,
-	req OrbitParametersUpdateRequest,
+	req UpdateOrbitParametersRequest,
 ) (*OrbitParameters, error) {
 	var params OrbitParameters
 	path := "/v1/satellites/" + satelliteID + "/orbit-parameters"
@@ -312,4 +356,28 @@ func (c *Client) ListConfigurations(
 		return nil, err
 	}
 	return resp.Configurations, nil
+}
+
+// ListTrackingSettings calls GET /v1/satellites/{id}/tracking-settings.
+func (c *Client) ListTrackingSettings(ctx context.Context, satelliteID string) ([]TrackingSetting, error) {
+	var resp ListTrackingSettingsResponse
+	path := "/v1/satellites/" + satelliteID + "/tracking-settings"
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, nil, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Settings, nil
+}
+
+// UpdateTrackingSetting calls PUT /v1/satellites/{id}/ground-stations/{gs}/tracking-settings.
+func (c *Client) UpdateTrackingSetting(
+	ctx context.Context,
+	satelliteID, groundStationID, mode string,
+) (*TrackingSetting, error) {
+	var setting TrackingSetting
+	path := "/v1/satellites/" + satelliteID + "/ground-stations/" + groundStationID + "/tracking-settings"
+	body := UpdateTrackingSettingRequest{DefaultMode: mode}
+	if err := c.doJSON(ctx, http.MethodPut, path, nil, body, &setting); err != nil {
+		return nil, err
+	}
+	return &setting, nil
 }

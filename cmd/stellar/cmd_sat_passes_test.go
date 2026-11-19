@@ -57,6 +57,21 @@ func newTestPassServer(t *testing.T) *httptest.Server {
 			"line2": "2 27424  98.4040 310.2912 0001189 114.3209   1.9707 14.61815411256417",
 		},
 	}
+	epoch := time.Date(2026, 11, 10, 3, 4, 5, 0, time.UTC)
+	activatedAt := time.Date(2026, 11, 10, 6, 0, 0, 0, time.UTC)
+	passDetail := passes[0]
+	passDetail.OrbitData = &apiclient.PassOrbitData{
+		OrbitDataID:  "od-1",
+		Epoch:        &epoch,
+		ActivationID: "act-1",
+		ActivatedAt:  &activatedAt,
+	}
+	history := apiclient.ListOrbitDataResponse{SatelliteID: "sat-1", Items: []apiclient.OrbitHistoryItem{{
+		ID:           "od-1",
+		ActivationID: "act-1",
+		Epoch:        &epoch,
+		ActivatedAt:  &activatedAt,
+	}}}
 	orbitParams := apiclient.OrbitParameters{
 		ID:                "op-1",
 		SatelliteID:       "sat-1",
@@ -73,6 +88,10 @@ func newTestPassServer(t *testing.T) *httptest.Server {
 			json.NewEncoder(w).Encode(passes[0])
 		case strings.HasPrefix(r.URL.Path, "/v1/passes/") && r.Method == http.MethodDelete:
 			json.NewEncoder(w).Encode(passes[0])
+		case r.URL.Path == "/v1/passes/p-1" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(passDetail)
+		case strings.HasSuffix(r.URL.Path, "/orbit-data/history"):
+			json.NewEncoder(w).Encode(history)
 		case r.URL.Path == "/v1/visibilities":
 			json.NewEncoder(w).Encode(visibilities)
 		case r.URL.Path == "/v1/satellites":
@@ -220,6 +239,75 @@ func TestReservePassCommandRequiresBookingWindow(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "--booking-start and --booking-stop are required") {
 		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// runPassCommand runs the CLI against the test pass server and returns stdout.
+func runPassCommand(t *testing.T, args ...string) string {
+	t.Helper()
+	srv := newTestPassServer(t)
+	defer srv.Close()
+	tokSrv := setupAuthForTest(t)
+	defer tokSrv.Close()
+
+	root := NewRootCommand()
+	var buf bytes.Buffer
+	root.SetOut(&buf)
+	root.SetArgs(append(args, "--api-url", srv.URL))
+	if err := root.Execute(); err != nil {
+		t.Fatalf("%v: %v", args, err)
+	}
+	return buf.String()
+}
+
+// get-pass names the orbit data the pass was computed from (issue #969).
+func TestGetPassCommandShowsOrbitData(t *testing.T) {
+	out := runPassCommand(t, "satellite", "get-pass", "p-1")
+
+	for _, want := range []string{
+		"ORBIT_DATA_ID", "od-1",
+		"ORBIT_DATA_EPOCH", "2026-11-10T03:04:05Z",
+		"ORBIT_DATA_ACTIVATION_ID", "act-1",
+		"ORBIT_DATA_ACTIVATED", "2026-11-10T06:00:00Z",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("get-pass output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestGetPassCommandJSONCarriesOrbitData(t *testing.T) {
+	out := runPassCommand(t, "satellite", "get-pass", "p-1", "--output", "json")
+
+	var rows []apiclient.Pass
+	if err := json.Unmarshal([]byte(out), &rows); err != nil || len(rows) != 1 {
+		t.Fatalf("parse get-pass JSON: %v\n%s", err, out)
+	}
+	od := rows[0].OrbitData
+	if od == nil || od.OrbitDataID != "od-1" || od.ActivationID != "act-1" {
+		t.Fatalf("orbit_data = %+v, want od-1 / act-1", od)
+	}
+	if od.Epoch == nil || !od.Epoch.Equal(time.Date(2026, 11, 10, 3, 4, 5, 0, time.UTC)) {
+		t.Errorf("epoch = %v", od.Epoch)
+	}
+}
+
+// A pass without orbit data leaves the columns blank rather than failing.
+func TestPassOrbitDataWithoutOrbitData(t *testing.T) {
+	if got := passOrbitData(&apiclient.Pass{ID: "p-1"}); got != (apiclient.PassOrbitData{}) {
+		t.Errorf("passOrbitData = %+v, want empty", got)
+	}
+}
+
+// The orbit data history shows each entry's activation ID, which get-pass
+// reports as ORBIT_DATA_ACTIVATION_ID.
+func TestGetOrbitDataHistoryCommandShowsActivationID(t *testing.T) {
+	out := runPassCommand(t, "satellite", "get-orbit-data-history", "--satellite-id", "sat-1")
+
+	for _, want := range []string{"ACTIVATION_ID", "act-1", "od-1"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("get-orbit-data-history output missing %q:\n%s", want, out)
+		}
 	}
 }
 

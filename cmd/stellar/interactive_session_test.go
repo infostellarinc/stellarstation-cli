@@ -1,11 +1,13 @@
 package main
 
 import (
-	"context"
+	"errors"
 	"io"
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 // captureStderr runs fn with os.Stderr redirected to a pipe and returns what
@@ -36,7 +38,8 @@ func captureStderr(t *testing.T, fn func()) string {
 // both command types enabled and no booking window restriction.
 func commandingSession(targets []channelTarget) *interactiveSession {
 	cfg := Config{EnableUplink: true, EnableConfigRequests: true}
-	return newInteractiveSession(cfg, targets, nil, "stream-1", "plan-1", newStatsTracker(false), passWindow{})
+	pub := newCommandPublisher(nil, 1, newStatsTracker(false), passWindow{})
+	return newInteractiveSession(cfg, targets, pub, "stream-1", "plan-1")
 }
 
 // A stream whose channels accept no satellite commands must reject a "sat"
@@ -48,7 +51,7 @@ func TestInteractiveSatWithoutUplinkChannel(t *testing.T) {
 	})
 
 	out := captureStderr(t, func() {
-		s.sendSatCommand(context.Background(), []string{"aaaabbbb"})
+		s.sendSatCommand([]string{"aaaabbbb"})
 	})
 
 	if !strings.Contains(out, "ERROR: this stream has no uplink channel") {
@@ -67,7 +70,7 @@ func TestInteractiveGsWithoutConfigRequestChannel(t *testing.T) {
 	})
 
 	out := captureStderr(t, func() {
-		s.sendGsConfig(context.Background(), []string{`{}`})
+		s.sendGsConfig([]string{`{}`})
 	})
 
 	if !strings.Contains(out, "ERROR: this stream has no config_request channel") {
@@ -102,11 +105,33 @@ func TestInteractiveSendWithoutAnyChannels(t *testing.T) {
 	s := commandingSession(nil)
 
 	out := captureStderr(t, func() {
-		s.sendSatCommand(context.Background(), []string{"aaaabbbb"})
-		s.sendGsConfig(context.Background(), []string{`{}`})
+		s.sendSatCommand([]string{"aaaabbbb"})
+		s.sendGsConfig([]string{`{}`})
 	})
 
 	if !strings.Contains(out, "no uplink channel") || !strings.Contains(out, "no config_request channel") {
 		t.Errorf("output = %q, want both command types rejected", out)
 	}
+}
+
+// A command the broker did not confirm may still arrive, so its index stays
+// used and the next command takes the one after; a command never handed to
+// the broker (here: no connection) frees its index.
+func TestInteractiveUnconfirmedPublishKeepsItsIndex(t *testing.T) {
+	targets := []channelTarget{{ChannelID: "ch-1", UplinkTopic: "topic/uplink", ConfigRequestTopic: "topic/config"}}
+	cfg := Config{EnableUplink: true, EnableConfigRequests: true}
+
+	failing := newInteractiveSession(cfg, targets,
+		newTestPublisher(t, &mockMQTTClientWriter{connected: true, pubErr: errors.New("timeout")}), "stream-1", "plan-1")
+	failing.sendSatCommand([]string{"aaaabbbb"})
+	failing.sendGsConfig([]string{`{}`})
+	assert.Equal(t, uint32(2), failing.satIndices[0], "the unconfirmed command keeps index 1")
+	assert.Equal(t, uint32(2), failing.gsIndices[0])
+
+	unsent := newInteractiveSession(cfg, targets,
+		newTestPublisher(t, &mockMQTTClientWriter{connected: false}), "stream-1", "plan-1")
+	unsent.sendSatCommand([]string{"aaaabbbb"})
+	unsent.sendGsConfig([]string{`{}`})
+	assert.Equal(t, uint32(1), unsent.satIndices[0], "a command never published frees its index")
+	assert.Equal(t, uint32(1), unsent.gsIndices[0])
 }

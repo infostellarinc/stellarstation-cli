@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/infostellarinc/stellarstation-cli/internal/passdir"
 )
 
 const unknownFraming = "unknown"
@@ -185,6 +187,7 @@ func writeChunkToFile(
 	stats *statsTracker, // Optional: for checksum tracking
 	writeInOrder bool, // Whether we're writing in order (affects checksum calculation)
 	cfg Config, // Config for stdout and output file options
+	sendTimestamp time.Time, // Optional: server-side send time (zero if unavailable); written as a sidecar file only, never affects data/mtime
 ) error {
 	// Write to stdout FIRST (time-critical for downstream consumers of the pipe)
 	writeToStdout(data, cfg)
@@ -222,6 +225,21 @@ func writeChunkToFile(
 
 	if err := writeChunkData(data, destPath, stats); err != nil {
 		return err
+	}
+
+	// Optional sidecar: the chunk's station-side send time, when the station
+	// provided one (fake-station and cloud-station both stamp
+	// TimeFirstByteReceived). This mirrors writeNonTelemetryMessage's
+	// recordedAt field, but has to sit out of band because telemetry chunks
+	// are raw bytes rather than JSON. It is write-only as far as this package
+	// is concerned; the e2e tests read it back to measure one-way latency.
+	// Writing it never touches destPath or its mtime, which the tests use as
+	// the receive-time proxy.
+	if !sendTimestamp.IsZero() {
+		sidecar := destPath + passdir.SendTimestampSuffix
+		if err := os.WriteFile(sidecar, []byte(sendTimestamp.UTC().Format(time.RFC3339Nano)), 0o600); err != nil {
+			log.Printf("WARNING: failed to write send-timestamp sidecar %s: %v", sidecar, err)
+		}
 	}
 
 	// Track data for checksum calculation (only for telemetry, in in-order mode)

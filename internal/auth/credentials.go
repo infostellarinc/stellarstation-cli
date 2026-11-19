@@ -49,6 +49,9 @@ type Credentials struct {
 	ClientSecret  string `json:"clientSecret"`
 	TokenEndpoint string `json:"tokenEndpoint"`
 	Scope         string `json:"scope,omitempty"`
+	// APIURL is the StellarStation API this key belongs to, remembered by
+	// `stellar interactive` so commands need no STELLAR_API_URL. Optional.
+	APIURL string `json:"apiUrl,omitempty"`
 }
 
 // Validate checks that the credentials have the fields required to mint a
@@ -92,6 +95,7 @@ type createAPIKeyResponseShape struct {
 	ClientSecret  string `json:"clientSecret"`
 	TokenEndpoint string `json:"tokenEndpoint"`
 	Scope         string `json:"scope"`
+	APIURL        string `json:"apiUrl"`
 }
 
 // Parse parses raw JSON bytes into Credentials, accepting:
@@ -114,6 +118,7 @@ func Parse(data []byte) (*Credentials, error) {
 		ClientSecret:  raw.ClientSecret,
 		TokenEndpoint: raw.TokenEndpoint,
 		Scope:         raw.Scope,
+		APIURL:        raw.APIURL,
 	}
 	if creds.ClientID == "" && raw.APIKey != nil {
 		creds.ClientID = raw.APIKey.ClientID
@@ -176,6 +181,7 @@ func Save(path string, creds *Credentials) error {
 		ClientSecret:  creds.ClientSecret,
 		TokenEndpoint: creds.TokenEndpoint,
 		Scope:         creds.EffectiveScope(),
+		APIURL:        creds.APIURL,
 	}
 	data, err := json.MarshalIndent(out, "", "  ")
 	if err != nil {

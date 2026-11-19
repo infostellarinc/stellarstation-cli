@@ -16,14 +16,17 @@ func newSatelliteCommand() *cobra.Command {
   See your fleet        list-satellites
   Plan a pass           list-visibilities, list-configurations
   Book a pass           reserve-pass, update-pass, cancel-pass, list-passes, get-pass
-  Run a pass live       open-stream   (receive telemetry, send commands)
+  Run a pass live       open-stream   (receive telemetry, send commands),
+                        revoke-stream (cut off another client's stream)
   Manage orbit data     add-tle, get-tle, get-tle-history, set-tle-source, get-tle-source
+  Pass tracking         get-tracking-settings, set-tracking-default
 
 Run any command with --help to see what it does and an example.`,
 	}
 
 	cmd.AddCommand(
 		newOpenStreamCommand(),
+		newRevokeStreamCommand(),
 		newListSatellitesCommand(),
 		newListVisibilitiesCommand(),
 		newListConfigurationsCommand(),
@@ -35,8 +38,11 @@ Run any command with --help to see what it does and an example.`,
 		newAddTLECommand(),
 		newGetTLECommand(),
 		newGetTLEHistoryCommand(),
+		newGetOrbitDataUploadCommand(),
 		newSetTLESourceCommand(),
 		newGetTLESourceCommand(),
+		newGetTrackingSettingsCommand(),
+		newSetTrackingDefaultCommand(),
 	)
 
 	return cmd

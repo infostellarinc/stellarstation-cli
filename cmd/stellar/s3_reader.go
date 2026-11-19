@@ -41,6 +41,7 @@ func spawnS3Fetcher(
 	route func(fetchResult),
 	inFlight *sharedCounter[channelFramingKey],
 	credsLogged *sync.Map,
+	onRetry fetchRetryReporter,
 ) {
 	key := channelFramingKey{ChannelID: channelID, Framing: framing}
 	inFlight.inc(key)
@@ -55,6 +56,7 @@ func spawnS3Fetcher(
 			f,
 			pollInterval,
 			credsLogged,
+			onRetry,
 		)
 		route(res)
 	}(channelID, index, framing)
@@ -87,6 +89,7 @@ func spawnS3Fetchers(
 	nextWriteShared *sharedCounter[channelFramingKey],
 	inFlight *sharedCounter[channelFramingKey],
 	credsLogged *sync.Map,
+	onRetry fetchRetryReporter,
 ) {
 	// Try each channel's framing combinations. Framings are per-channel (from the
 	// authorizer metadata) so we don't probe framings a channel never emits.
@@ -114,6 +117,7 @@ func spawnS3Fetchers(
 					route,
 					inFlight,
 					credsLogged,
+					onRetry,
 				)
 				nextFetch[key]++
 			}
@@ -157,9 +161,9 @@ func classifyS3FetchResult(res fetchResult, stats *statsTracker) (done, handled 
 	)
 	stats.AddError(errMsg)
 	if isTransientS3AuthError(res.Err) {
-		// Rotated credentials are still propagating; this object is retried on the
-		// next poll, so keep it out of the operator's face and only surface it
-		// under --verbose.
+		// Rotated credentials are still propagating. Fetches now retry these
+		// themselves (see fetchIndexForFraming), so this only remains for any
+		// result that still carries one; keep it to --verbose.
 		vlogf("Transient credential error while fetching telemetry (retrying): %v", errMsg)
 		return false, true
 	}
@@ -200,6 +204,7 @@ func newS3InOrderWorker(
 					stats,
 					cfg.WriteInOrder,
 					cfg,
+					pr.SendTimestamp,
 				); err != nil {
 					stats.AddError(
 						fmt.Errorf(
@@ -310,6 +315,7 @@ func runS3InOrder(
 
 	nextFetch := make(map[channelFramingKey]int)
 	var credsLogged sync.Map
+	onRetry := newFetchRetryReporter(stats)
 
 	schedCtx, cancelSched := context.WithCancel(ctx)
 	defer cancelSched()
@@ -317,7 +323,7 @@ func runS3InOrder(
 		ticker := time.NewTicker(s3SchedulerTick)
 		defer ticker.Stop()
 		for {
-			spawnS3Fetchers(schedCtx, cfg, s3c, route, nextFetch, nextWriteShared, inFlight, &credsLogged)
+			spawnS3Fetchers(schedCtx, cfg, s3c, route, nextFetch, nextWriteShared, inFlight, &credsLogged, onRetry)
 			select {
 			case <-schedCtx.Done():
 				return
@@ -362,6 +368,7 @@ func spawnS3FetchersRelaxed(
 	inFlight *sharedCounter[channelFramingKey],
 	activeKeys *keyedSet[channelFramingKey],
 	credsLogged *sync.Map,
+	onRetry fetchRetryReporter,
 ) {
 	// Try each channel's framing combinations. Framings are per-channel (from the
 	// authorizer metadata) so we don't probe framings a channel never emits.
@@ -387,6 +394,7 @@ func spawnS3FetchersRelaxed(
 				route,
 				inFlight,
 				credsLogged,
+				onRetry,
 			)
 			nextFetch[key]++
 			activeKeys.add(key)
@@ -584,6 +592,7 @@ func newS3RelaxedWorker(
 					stats,
 					cfg.WriteInOrder,
 					cfg,
+					res.SendTimestamp,
 				); err != nil {
 					stats.AddError(
 						fmt.Errorf(
@@ -675,6 +684,7 @@ func runS3Relaxed(
 
 	nextFetch := make(map[channelFramingKey]int)
 	var credsLogged sync.Map
+	onRetry := newFetchRetryReporter(stats)
 
 	schedCtx, cancelSched := context.WithCancel(ctx)
 	defer cancelSched()
@@ -682,7 +692,7 @@ func runS3Relaxed(
 		ticker := time.NewTicker(s3SchedulerTick)
 		defer ticker.Stop()
 		for {
-			spawnS3FetchersRelaxed(schedCtx, cfg, s3c, route, nextFetch, inFlight, activeKeys, &credsLogged)
+			spawnS3FetchersRelaxed(schedCtx, cfg, s3c, route, nextFetch, inFlight, activeKeys, &credsLogged, onRetry)
 			select {
 			case <-schedCtx.Done():
 				return
@@ -757,6 +767,7 @@ func fetchIndexForFraming(
 	framing string,
 	pollInterval time.Duration,
 	credsLogged *sync.Map,
+	onRetry fetchRetryReporter,
 ) fetchResult {
 	// Log credentials once per worker goroutine (using worker ID as key)
 	// This helps detect if workers are using different credentials than initialization
@@ -821,13 +832,20 @@ func fetchIndexForFraming(
 		// Low-rate format: <passID>/channel/<channelID>/downlink/<framing>/<index>
 		key = fmt.Sprintf("%s/channel/%s/downlink/%s/%d", passID, channelID, framing, index)
 	}
-	for {
+	backoff := newFetchBackoff(pollInterval)
+	for attempt := 1; ; {
 		out, err := s3c.GetObject(ctx, &s3.GetObjectInput{
 			Bucket: aws.String(bucket),
 			Key:    aws.String(key),
 		})
 		if err == nil {
-			return processS3ObjectSuccess(out, channelID, index, key)
+			res := processS3ObjectSuccess(out, channelID, index, key)
+			if res.Err == nil || ctx.Err() != nil {
+				return res
+			}
+			// The object exists but its body did not arrive whole (a connection
+			// reset mid-download): fetch it again like any other failure.
+			err = res.Err
 		}
 
 		if ctx.Err() != nil {
@@ -838,29 +856,86 @@ func fetchIndexForFraming(
 			}
 		}
 
-		// 404, NoSuchKey or NotFound: treat as "not uploaded yet, retry".
+		wait := pollInterval
 		if isNotFound(err) {
-			// Intentionally quiet: we poll frequently and don't want spam.
-			select {
-			case <-ctx.Done():
-				return fetchResult{
-					Index:     index,
-					ChannelID: channelID, // Preserve channel ID in error case
-					Err:       ctx.Err(),
-				}
-			case <-time.After(pollInterval):
-				continue
+			// 404, NoSuchKey or NotFound: not uploaded yet. Intentionally quiet:
+			// we poll frequently and don't want spam.
+			backoff.reset()
+		} else {
+			// Anything else is retried too, backing off. Giving up on one index
+			// would stall the in-order writer for good: it waits for that index,
+			// the fetch window fills behind it and nothing more is received.
+			if onRetry != nil {
+				onRetry(channelID, index, framing, attempt, fmt.Errorf("GetObject %s: %w", key, err))
 			}
+			attempt++
+			wait = backoff.next()
 		}
 
-		// Any other error is real.
-		return fetchResult{
-			Index:     index,
-			ChannelID: channelID, // Preserve channel ID in error case
-			Err:       fmt.Errorf("GetObject %s: %w", key, err),
+		select {
+		case <-ctx.Done():
+			return fetchResult{
+				Index:     index,
+				ChannelID: channelID, // Preserve channel ID in error case
+				Err:       ctx.Err(),
+			}
+		case <-time.After(wait):
 		}
 	}
 }
+
+// fetchRetryReporter is told about each failed attempt to fetch an object
+// that is then retried. attempt counts from 1 for each object.
+type fetchRetryReporter func(channelID string, index int, framing string, attempt int, err error)
+
+// newFetchRetryReporter reports an object's first failure the way a failed
+// fetch always was (diagnostics, and a line for the operator unless it is a
+// credential rotation blip), and later attempts only under --verbose, so a
+// lasting outage does not flood the screen.
+func newFetchRetryReporter(stats *statsTracker) fetchRetryReporter {
+	return func(channelID string, index int, framing string, attempt int, err error) {
+		errMsg := fmt.Errorf("fetching channel %s index %d framing %s: %w", channelID, index, framing, err)
+		if attempt > 1 {
+			vlogf("Still retrying telemetry (attempt %d): %v", attempt, errMsg)
+			return
+		}
+		if stats != nil {
+			stats.AddError(errMsg)
+		}
+		if isTransientS3AuthError(err) {
+			vlogf("Transient credential error while fetching telemetry (retrying): %v", errMsg)
+			return
+		}
+		streamErrf(err, "Problem while receiving telemetry: %v (retrying)", errMsg)
+	}
+}
+
+// fetchBackoff spaces retries of a failing fetch: from the poll interval,
+// doubling up to maxFetchBackoff.
+type fetchBackoff struct {
+	base, current time.Duration
+}
+
+const (
+	minFetchBackoff = 250 * time.Millisecond
+	maxFetchBackoff = 15 * time.Second
+)
+
+func newFetchBackoff(pollInterval time.Duration) *fetchBackoff {
+	base := max(pollInterval, minFetchBackoff)
+	return &fetchBackoff{base: base}
+}
+
+func (b *fetchBackoff) next() time.Duration {
+	if b.current == 0 {
+		b.current = b.base
+	} else {
+		b.current = min(b.current*2, maxFetchBackoff)
+	}
+	return b.current
+}
+
+func (b *fetchBackoff) reset() { b.current = 0 }
 
 // extractFramingFromS3Key extracts the framing type from an S3 key path.
 //
@@ -917,18 +992,13 @@ func processS3ObjectSuccess(
 	// Try to parse as protobuf first, but if that fails, treat it as raw bytes.
 	var payload []byte
 	var messageID string
+	var sendTimestamp time.Time
 	msg := &streaming.FromStarPassMessage{}
 	if err := proto.Unmarshal(raw, msg); err == nil {
 		// Successfully parsed as protobuf - extract telemetry data
 		messageID = msg.GetMessageId()
-		sendTelemetry := msg.GetSendTelemetryMessage()
-		if sendTelemetry != nil {
-			for _, t := range sendTelemetry.GetTelemetry() {
-				if d := t.GetData(); len(d) > 0 {
-					payload = append(payload, d...)
-				}
-			}
-		}
+		payload = extractMessagePayload(msg)
+		sendTimestamp = telemetrySendTimestamp(msg)
 	} else {
 		// Not protobuf - treat as raw telemetry bytes (high-rate format)
 		payload = raw
@@ -941,14 +1011,15 @@ func processS3ObjectSuccess(
 	// Note: for END or non-telemetry messages, payload may be empty.
 	// END detection is still done via S3 metadata (isEndMessage).
 	return fetchResult{
-		Index:     index,
-		ChannelID: channelID, // Always use the channel ID from the S3 path
-		Framing:   framing,   // Framing type extracted from S3 key
-		Data:      payload,
-		Metadata:  out.Metadata,
-		Err:       nil,
-		Source:    SourceS3,
-		MessageID: messageID,
+		Index:         index,
+		ChannelID:     channelID, // Always use the channel ID from the S3 path
+		Framing:       framing,   // Framing type extracted from S3 key
+		Data:          payload,
+		Metadata:      out.Metadata,
+		Err:           nil,
+		Source:        SourceS3,
+		MessageID:     messageID,
+		SendTimestamp: sendTimestamp,
 	}
 }
 

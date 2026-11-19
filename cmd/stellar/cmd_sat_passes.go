@@ -15,9 +15,9 @@ import (
 //nolint:gochecknoglobals
 var passColumns = buildPassColumns()
 
-// getPassColumns extends passColumns with the overlapping-passes column. Only
-// GET /v1/passes/{id} computes `overlapping_passes` (the list endpoint does
-// not), so only get-pass shows the column.
+// getPassColumns extends passColumns with the columns only GET /v1/passes/{id}
+// computes (the list endpoint does not): the overlapping passes and the orbit
+// data the pass was computed from.
 //
 //nolint:gochecknoglobals
 var getPassColumns = append(append([]printer.Column{}, passColumns...),
@@ -29,7 +29,27 @@ var getPassColumns = append(append([]printer.Column{}, passColumns...),
 		}
 		return strings.Join(ids, " ")
 	}},
+	printer.Column{Header: "ORBIT_DATA_ID", Extract: func(r interface{}) string {
+		return passOrbitData(r).OrbitDataID
+	}},
+	printer.Column{Header: "ORBIT_DATA_EPOCH", Extract: func(r interface{}) string {
+		return formatOptionalTime(passOrbitData(r).Epoch)
+	}},
+	printer.Column{Header: "ORBIT_DATA_ACTIVATION_ID", Extract: func(r interface{}) string {
+		return passOrbitData(r).ActivationID
+	}},
+	printer.Column{Header: "ORBIT_DATA_ACTIVATED", Extract: func(r interface{}) string {
+		return formatOptionalTime(passOrbitData(r).ActivatedAt)
+	}},
 )
+
+// passOrbitData returns the pass's orbit data, empty when the API left it out.
+func passOrbitData(r interface{}) apiclient.PassOrbitData {
+	if od := r.(*apiclient.Pass).OrbitData; od != nil { //nolint:errcheck
+		return *od
+	}
+	return apiclient.PassOrbitData{}
+}
 
 // buildPassColumns assembles the list-passes table columns. The satellite and
 // ground-station columns are shared with list-visibilities via satelliteColumns
@@ -163,6 +183,8 @@ Example:
 	cmd.Flags().String("execution-config-id", "", "Which configuration to run (required; from list-configurations)")
 	cmd.Flags().String("booking-start", "", "When the pass should start, e.g. 2026-01-15T10:00:00Z (required)")
 	cmd.Flags().String("booking-stop", "", "When the pass should end, e.g. 2026-01-15T10:12:00Z (required)")
+	cmd.Flags().String("tracking-mode", "",
+		"How the pass follows a new TLE: TRACK_STATIC_OFFSETS or NONE (default: the satellite's setting at this ground station)")
 	_ = cmd.MarkFlagRequired("satellite-id")
 	_ = cmd.MarkFlagRequired("ground-station-id")
 	_ = cmd.MarkFlagRequired("execution-config-id")
@@ -202,13 +224,17 @@ func runReservePass(cmd *cobra.Command, _ []string) error {
 		return errors.New("--booking-start and --booking-stop are required")
 	}
 
-	pass, err := client.CreatePass(cmd.Context(), apiclient.PassCreateRequest{
+	request := apiclient.CreatePassRequest{
 		SatelliteID:       satID,
 		GroundStationID:   gsID,
 		ExecutionConfigID: execCfg,
 		Booking:           apiclient.Interval{Start: *bStart, Stop: *bStop},
 		Scheduled:         apiclient.Interval{Start: *bStart, Stop: *bStop},
-	})
+	}
+	if mode, _ := cmd.Flags().GetString("tracking-mode"); mode != "" {
+		request.Tracking = &apiclient.PassTracking{Mode: strings.ToUpper(strings.TrimSpace(mode))}
+	}
+	pass, err := client.CreatePass(cmd.Context(), request)
 	if err != nil {
 		return err
 	}
@@ -307,7 +333,7 @@ func runUpdatePass(cmd *cobra.Command, args []string) error {
 	stopStr, _ := cmd.Flags().GetString("scheduled-stop")
 	execCfg, _ := cmd.Flags().GetString("execution-config-id")
 
-	var req apiclient.PassUpdateRequest
+	var req apiclient.UpdatePassRequest
 	if startStr != "" || stopStr != "" {
 		if startStr == "" || stopStr == "" {
 			return errors.New("to reschedule, give both --scheduled-start and --scheduled-stop (not just one)")

@@ -82,6 +82,24 @@ using the folder your own computer printed. To avoid typing the full path every
 time, add that `bin` folder to your PATH, following Go's own instructions at
 <https://go.dev/doc/install>.
 
+### Interactive mode
+
+After installing, run:
+
+```
+stellar interactive
+```
+
+(or just `stellar` in a terminal). Interactive mode asks for your API key file and
+API address the first time and remembers them, then offers the common
+workflows as menus: stream your next pass, see, change and cancel upcoming passes,
+find a free window and book a pass on it, and open a stream with the options
+you choose. Each step prints the equivalent command, so you can script it
+later. Use the arrow keys to move, type to filter a list, Enter to choose and
+Esc to go back.
+
+The steps below do the same setup by hand.
+
 ### 2. Configure the API address
 
 Your StellarStation contact gives you an API address, which looks like a web
@@ -98,8 +116,9 @@ $env:STELLAR_API_URL = 'https://api.example.stellarstation.com'
 ```
 
 This lasts until you close the terminal window. To avoid retyping it, set the
-variable permanently in your shell profile, or add `--api-url <address>` to
-every command instead.
+variable permanently in your shell profile, add `--api-url <address>` to
+every command, or let `stellar interactive` remember the address with your API key
+(the variable and `--api-url` still take precedence when set).
 
 ### 3. Activate your API key
 
@@ -186,6 +205,12 @@ data topics, which normally takes 20 to 30 seconds. Starting 1 minute early
 leaves margin for that, so the client is listening before the first frame
 arrives.
 
+There is also an earliest time: connections to a pass open 24 hours before
+AOS, unless StellarStation has set a different time for your organization,
+satellite or ground station, and stay open through the pass and after it,
+while its data is kept. Before then the command exits with a message saying
+when the pass opens.
+
 Downlinked data is written to a `downlink` folder in the directory you ran the
 command from, as it arrives, and throughput is reported while the pass runs.
 Press Ctrl-C to stop, or add `--enable-auto-close` to exit automatically when the
@@ -215,6 +240,10 @@ stellar satellite get-pass <pass-id>
 
 `list-passes` accepts `--satellite-id`, `--start` and `--stop` to narrow the
 window, and `--execution-status` to show only passes in a given state.
+
+`get-pass` also shows the orbit data the pass's AOS and LOS were computed from:
+its ID, epoch, and the `get-orbit-data-history` entry that made it active
+(`ORBIT_DATA_ACTIVATION_ID`, which that command lists as `ACTIVATION_ID`).
 
 Move a reserved pass to a different window, or release it entirely:
 
@@ -264,6 +293,51 @@ A single command carries up to 100 KiB (102400 bytes). A larger command is
 refused before anything is transmitted, so send it as several smaller
 commands.
 
+A one-shot send waits for the ground station before it exits, and its exit
+code reports the result. By default it waits for the acknowledgement; add
+`--wait-for final` to wait until the ground station reports the command
+radiated (or a ground station configuration applied):
+
+```
+stellar satellite open-stream --pass-id <pass-id> --send-sat-command 0A1B2C3D --wait-for final
+```
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | Accepted (`--wait-for received`), or delivered (`--wait-for final`) |
+| `1` | Refused, failed, partially applied or not applied, or not transmitted; or another error |
+| `3` | Outcome unknown, including no answer within `--wait-timeout`. Check spacecraft telemetry before sending the command again |
+| `4` | The stream was revoked (by an operator, or by another client taking over commanding) and StellarStation disconnected it; open a new stream. Any session, interactive or not, stops this way when its stream is revoked |
+
+When several commands are sent, `3` wins over `1`. If the ground station does
+not report delivery status, `--wait-for final` says so and waits for the
+acknowledgement only.
+
+No command path (interactive, one-shot or the proxy) sends an unanswered
+command again on its own: a copy sent during a pass only adds to the
+congestion that delayed the first, and the ground station may already have
+transmitted it. An unanswered command is reported as unknown. Typing a
+command again, or running a script again, sends a new command, which is
+transmitted again.
+
+Where the ground station supports it, it also reports what happened to each
+command after the acknowledgement: passed to the ground station equipment,
+radiated (with the time), applied or partially applied (for a ground station
+configuration request, with each refused setting), rejected by the ground
+station equipment (with the reason and the raw equipment code, such as
+`cortex-tcu:12`), not transmitted, or outcome unknown. With `--verbose` each
+report is shown as a `[Status]` line:
+
+```
+[Status] command #3 radiated at 2026-10-01T12:30:05Z
+[Status] command #4 failed: the latest allowed transmission time passed (cortex-tcu:12)
+[Status] commands #5 to #6 were not received by the ground station in time and were not transmitted
+```
+
+The ground station transmits each channel's commands once, in index order. A
+command that arrives after later ones were transmitted is refused as arrived
+late and never transmitted.
+
 Typing and one-shot options are not the only way to command. With `--proxy udp`
 or `--proxy tcp`, your own ground software connects to a local socket, and
 anything it sends is transmitted to the satellite while telemetry is forwarded
@@ -308,6 +382,59 @@ With the source set to `automatic`, StellarStation keeps the orbit data current
 from public catalogues. With `manual`, only the elements you upload are used, and
 an upload is rejected while the source is `automatic`.
 
+## Raising a ticket
+
+When a pass goes wrong, raise a ticket so Infostellar and your own operators
+can follow it to resolution. A ticket belongs to the organization that raised
+it; nobody outside your organization can see it.
+
+```
+stellar ticket create --title "Downlink dropped mid-pass" --severity HIGH --pass-id <pass-id>
+stellar ticket list
+stellar ticket get <ticket-id>
+```
+
+`--severity` is LOW, MEDIUM or HIGH. `--issue-type` (ANOMALY, PERFORMANCE,
+BILLING, REQUEST or OTHER) and `--accountable` (INFOSTELLAR, SATELLITE_OPERATOR
+or GROUND_STATION_OPERATOR) are optional, as are the report fields
+`--anomaly-description`, `--root-cause`, `--corrective-action` and
+`--preventive-action`.
+
+Keep the ticket up to date as you learn more. Only the options you give
+change; give `--preventive-action ""` to clear that field:
+
+```
+stellar ticket update <ticket-id> --root-cause "Antenna lost lock" --severity MEDIUM
+stellar ticket update <ticket-id> --action SATELLITE_OPERATOR="Re-upload the TLE"
+stellar ticket update <ticket-id> --status CLOSED --close-reason "Antenna realigned"
+```
+
+Attach the logs or monitoring data that go with the problem, and discuss it
+in comments:
+
+```
+stellar ticket upload-attachment <ticket-id> ./station.log
+stellar ticket list-attachments <ticket-id>
+stellar ticket download-attachment <ticket-id> <attachment-id>
+stellar ticket add-comment <ticket-id> "Re-uploaded the TLE, next pass looks good"
+stellar ticket watch <ticket-id>
+```
+
+A ticket may hold 20 attachments of up to 100 MiB each. `watch` subscribes you
+to the ticket's notifications; `unwatch` stops them.
+
+Raising, changing, commenting on and attaching to a ticket are things a person
+does, so they need to be signed in as a user rather than with an API key. Put a
+user token from the console in `STELLAR_BEARER_TOKEN` and the CLI sends it in
+place of the key:
+
+```
+export STELLAR_BEARER_TOKEN='<token copied from the console>'
+stellar ticket create --title "Downlink dropped mid-pass" --severity HIGH
+```
+
+Reading tickets works with the API key as well.
+
 ## Command help
 
 Every command accepts `--help`, which describes it, lists all of its options, and
@@ -336,6 +463,10 @@ through reserving passes and downloading telemetry, are in
 - **"Your API key was not accepted"**: the key is most likely issued for a
   different StellarStation environment than the address in `STELLAR_API_URL`.
   Confirm both with your StellarStation contact.
+- **"Could not set up this pass: this pass already has N open stream(s)"**:
+  the pass's configuration limits how many clients may stream it at once, and
+  that many are already connected. Close one of the other streams and try
+  again.
 - **A pass produced no telemetry**: confirm the window has started and the pass
   is still scheduled, with `stellar satellite get-pass <pass-id>`. If it has
   already completed, stream it again to retrieve whatever was received.
@@ -398,6 +529,36 @@ and defaults to 50.
 An upload is rejected while the source is `automatic`, so set the source to
 `manual` first if you intend to supply elements yourself.
 
+### Ticket commands
+
+| Command | What it does |
+| --- | --- |
+| `ticket list [--page-size N]` | List your organization's tickets, newest first |
+| `ticket get <ticket-id>` | Show one ticket; `--output json` includes its passes, actions and comments |
+| `ticket create --title ... --severity ...` | Raise a ticket; see the options below |
+| `ticket update <ticket-id> [options]` | Change only the options given; `--pass-id` and `--action` replace their lists |
+| `ticket delete <ticket-id>` | Delete a ticket and everything on it |
+| `ticket watch <ticket-id>`, `ticket unwatch <ticket-id>` | Follow or stop following a ticket |
+| `ticket list-comments <ticket-id>` | List comments |
+| `ticket add-comment <ticket-id> "<text>"` | Comment on a ticket |
+| `ticket update-comment <ticket-id> <comment-id> --text "<text>"` | Edit your own comment |
+| `ticket delete-comment <ticket-id> <comment-id>` | Delete your own comment |
+| `ticket list-attachments <ticket-id>` | List attached files with their sizes and uploaders |
+| `ticket upload-attachment <ticket-id> <file> [--content-type ...]` | Attach a file; the type is guessed from the extension |
+| `ticket download-attachment <ticket-id> <attachment-id> [--output-file path]` | Download a file; `-` writes to standard output |
+| `ticket delete-attachment <ticket-id> <attachment-id>` | Remove a file |
+
+Options for `create` and `update`: `--title`, `--severity` (LOW, MEDIUM, HIGH),
+`--issue-type` (ANOMALY, PERFORMANCE, BILLING, REQUEST, OTHER), `--accountable`
+(INFOSTELLAR, SATELLITE_OPERATOR, GROUND_STATION_OPERATOR), `--pass-id` (repeat
+for several), `--anomaly-description`, `--root-cause`, `--corrective-action`,
+`--preventive-action`, `--close-reason`, `--infostellar-assignee` and
+`--operator-assignee`. `update` also takes `--status` (OPEN, CLOSED) and
+`--action PARTY=text`.
+
+`STELLAR_BEARER_TOKEN`, when set, is sent as the bearer token instead of one
+minted from the API key. Ticket changes need it to be a user token.
+
 ### Choosing what a stream carries
 
 `open-stream` needs either `--pass-id` or `--satellite-id`. With
@@ -433,13 +594,15 @@ separately, so different clients can hold each.
 | `--send-sat-command <hex>` | none | Send one command, then exit |
 | `--send-sat-commands <hex,hex>` | none | Send several in the given order, then exit |
 | `--send-gs-config <json>` | none | Send one ground station configuration request, then exit |
+| `--wait-for <received\|final>` | `received` | What a one-shot send waits for before it exits: the acknowledgement, or the final delivery status |
+| `--wait-timeout <duration>` | `30s` | How long a one-shot send waits; past it the outcome is reported as unknown (exit code 3) |
 | `--interactive` | off | Keep the stream open and type commands as the pass runs |
 | `--override-commanding-lock` | off | Take commanding authority from the client that currently holds it |
 
 `--interactive` is the option to use for live operations. It keeps receiving
 telemetry while you enter commands, so you can react to what the satellite sends
-during the pass. The one-shot options exit once the command has been sent, which
-suits scripted use.
+during the pass. The one-shot options exit once the ground station has answered
+(see Commanding your satellite for the exit codes), which suits scripted use.
 
 A satellite command carries up to 100 KiB (102400 bytes) of payload. A command
 over that size is refused and nothing is transmitted.
@@ -461,7 +624,10 @@ nobody else is operating the pass before using it.
 | `--disable-diagnostics` | off | Do not write the diagnostics summary at the end of the pass |
 
 The diagnostics summary records what was received, what was acknowledged and
-where time was spent. Keep it enabled if you may need to raise a support case
+where time was spent. For each command it records whether it was accepted or
+refused (with the reason code), and the delivery
+status the ground station reported: stage, outcome, radiation time, failure,
+equipment code and reason. Keep it enabled if you may need to raise a support case
 about a pass.
 
 ### Forwarding to other software
@@ -500,8 +666,16 @@ remote access to the proxy.
 | --- | --- | --- |
 | `--stats` | off | Show live throughput and timing, and a summary per channel at the end |
 | `--enable-auto-close` | off | Exit when the satellite signals end of data, instead of waiting for Ctrl-C |
+| `--idle-timeout <duration>` | `2m` | Once the pass has ended, close the stream after it has been idle this long. `0` keeps it open until Ctrl-C |
 | `--verbose` | off | Show the technical detail of each step |
 | `--debug` | off | Show low-level detail. Very noisy, and intended for support cases |
+
+A stream that is still open after the pass ends closes itself once nothing has
+been sent or received for `--idle-timeout`, so a forgotten session does not run
+on. It warns 60, 30 and 10 seconds before closing, and any activity cancels the
+close and restarts the timer. With a timeout under a minute it announces the
+close as soon as the stream is idle and warns once more at the halfway point.
+Durations are written like `90s`, `2m` or `1h`.
 
 ### Advanced tuning
 
