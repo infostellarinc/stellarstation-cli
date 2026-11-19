@@ -332,3 +332,19 @@ func TestTicketAttachmentCommands(t *testing.T) {
 		t.Errorf("deleted %v", ts.deleted)
 	}
 }
+
+func TestAttachmentContentType(t *testing.T) {
+	cases := map[string]string{
+		"station.log":   "text/plain", // not in Go's table, and absent from Windows' MIME registry
+		"STATION.LOG":   "text/plain",
+		"readings.csv":  "text/csv",
+		"config.json":   "application/json", // Go's built-in table
+		"capture.weird": "application/octet-stream",
+		"noext":         "application/octet-stream",
+	}
+	for name, want := range cases {
+		if got := attachmentContentType(name); got != want {
+			t.Errorf("attachmentContentType(%q) = %q, want %q", name, got, want)
+		}
+	}
+}

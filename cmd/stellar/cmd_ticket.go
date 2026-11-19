@@ -710,10 +710,7 @@ func runUploadTicketAttachment(cmd *cobra.Command, args []string) error {
 	}
 	contentType, _ := cmd.Flags().GetString("content-type")
 	if contentType == "" {
-		contentType = mime.TypeByExtension(filepath.Ext(path))
-	}
-	if contentType == "" {
-		contentType = "application/octet-stream"
+		contentType = attachmentContentType(path)
 	}
 
 	client, err := newAPIClient(cmd)
@@ -814,4 +811,31 @@ func newDeleteTicketAttachmentCommand() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+// attachmentContentTypes covers the files operators attach most. Go's own
+// table knows only the web formats and otherwise asks the operating system,
+// whose answer varies by platform: Windows has no entry for .log at all. These
+// are fixed here so an upload is typed the same wherever the CLI runs.
+var attachmentContentTypes = map[string]string{
+	".log":  "text/plain",
+	".txt":  "text/plain",
+	".csv":  "text/csv",
+	".md":   "text/markdown",
+	".yaml": "application/yaml",
+	".yml":  "application/yaml",
+	".tle":  "text/plain",
+}
+
+// attachmentContentType guesses an attachment's content type from its file
+// extension, falling back to application/octet-stream.
+func attachmentContentType(path string) string {
+	ext := strings.ToLower(filepath.Ext(path))
+	if t, ok := attachmentContentTypes[ext]; ok {
+		return t
+	}
+	if t := mime.TypeByExtension(ext); t != "" {
+		return t
+	}
+	return "application/octet-stream"
 }
