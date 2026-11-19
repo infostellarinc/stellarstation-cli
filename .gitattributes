@@ -1,0 +1,3 @@
+# Keep line endings as committed on every platform: the Python contract test
+# matches the examples line by line, and goreleaser archives ship the sources.
+* text=auto eol=lf

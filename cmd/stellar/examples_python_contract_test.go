@@ -27,7 +27,9 @@ func readPythonStreaming(t *testing.T) string {
 	t.Helper()
 	src, err := os.ReadFile(pythonStreamingModule)
 	require.NoError(t, err)
-	return string(src)
+	// A checkout with CRLF line endings (git's autocrlf on Windows) would
+	// otherwise hide every constant from the line-anchored patterns.
+	return strings.ReplaceAll(string(src), "\r\n", "\n")
 }
 
 func TestPythonExampleFieldNumbersMatchTheProto(t *testing.T) {

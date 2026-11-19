@@ -3,6 +3,7 @@ package main
 import (
 	"io"
 	"os"
+	"runtime"
 	"testing"
 	"time"
 
@@ -12,6 +13,12 @@ import (
 
 func pipePump(t *testing.T) (*ttyPump, *os.File) {
 	t.Helper()
+	if runtime.GOOS == "windows" {
+		// The pump stops its reader with a read deadline, which pipes do not
+		// support on Windows. The pump is not used there either: there is no
+		// separate terminal handle, so prompts read standard input directly.
+		t.Skip("os.Pipe does not support read deadlines on Windows")
+	}
 	r, w, err := os.Pipe()
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = r.Close(); _ = w.Close() })
